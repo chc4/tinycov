@@ -50,7 +50,7 @@ add_library(tinykvm STATIC ${SOURCES})
 target_compile_definitions(tinykvm PUBLIC _GNU_SOURCE=1)
 target_include_directories(tinykvm PUBLIC .)
 target_compile_features(tinykvm PUBLIC cxx_std_20)
-target_link_libraries(tinykvm PUBLIC pthread rt)
+target_link_libraries(tinykvm PUBLIC pthread rt capstone)
 
 set_source_files_properties(
 	tinykvm/page_streaming.cpp
@@ -64,3 +64,12 @@ endif()
 if (KVM_EXPERIMENTAL)
 	target_compile_definitions(tinykvm PUBLIC TINYKVM_FAST_EXECUTION_TIMEOUT=1)
 endif()
+
+include(FetchContent)
+FetchContent_Declare(
+    capstone
+    GIT_REPOSITORY https://github.com/capstone-engine/capstone.git
+    GIT_TAG 5.0.1
+)
+
+FetchContent_MakeAvailable(capstone)

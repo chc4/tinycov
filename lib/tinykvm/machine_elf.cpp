@@ -176,7 +176,6 @@ void Machine::elf_loader(std::string_view binary, const MachineOptions& options)
 	if (is_dynamic) {
 		this->dynamic_linking(binary, options);
 	}
-
 	if (options.verbose_loader) {
 	printf("* Entry is at %p\n", (void*) m_start_address);
 	printf("* BRK is at %p -> %p\n", (void*) m_brk_address,

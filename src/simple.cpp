@@ -1,9 +1,14 @@
 #include <tinykvm/machine.hpp>
+#include <tinykvm/common.hpp>
+#include <linux/kvm.h>
+#include <tinykvm/amd64/gdt.hpp>
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include "assert.hpp"
 #include "load_file.hpp"
+
+#include <capstone/capstone.h>
 
 #include <tinykvm/rsp_client.hpp>
 #define GUEST_MEMORY   0x80000000  /* 2GB memory */
@@ -21,6 +26,73 @@ static uint64_t verify_exists(tinykvm::Machine& vm, const char* name)
 
 inline timespec time_now();
 inline long nanodiff(timespec start_time, timespec end_time);
+
+static uint32_t install_coverage_hooks(tinykvm::Machine& machine) {
+    uint32_t start_address = machine.registers().rip;
+    printf("elf start @ %p\n", start_address);
+    char *entry_mem = machine.main_memory().at(start_address, sizeof(uint32_t));
+    *((uint8_t*)entry_mem + 0) = 0xCC;
+    //*((uint8_t*)entry_mem + 0) = 0x90;
+    *((uint8_t*)entry_mem + 1) = 0x90;
+    *((uint8_t*)entry_mem + 2) = 0x90;
+    printf("bytes at start: %s\n", entry_mem);
+
+    csh handle;
+    cs_insn *insn;
+    size_t count;
+
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK)
+        return -1;
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON); //
+    size_t off = 0;
+    while(true) {
+        bool hit_branch = false;
+        // disassemble one inst at a time until we hit the end of the basic block
+        count = cs_disasm(handle, (const uint8_t*)(entry_mem + off), 0x1000, (uint32_t)(uintptr_t)(start_address + off), 1, &insn);
+        if (count > 0) {
+            size_t j;
+            for (j = 0; j < count; j++) {
+                cs_insn *i = &(insn[j]);
+                printf("0x%"PRIx64":\t%s\t\t%s\n", i->address, i->mnemonic,
+                        i->op_str);
+                cs_detail *detail = i->detail;
+                if (detail->groups_count > 0) {
+                    printf("\tinstruction group: ");
+                    for (int n = 0; n < detail->groups_count; n++) {
+                        printf("%s ", cs_group_name(handle, detail->groups[n]));
+                        if(detail->groups[n] == x86_insn_group::X86_GRP_JUMP) {
+                            printf(" x86_jmp!");
+                            //*(uint8_t*)(entry_mem + off) = 0xCD;
+                            //*(uint8_t*)(entry_mem + off + 1) = 0x03;
+                            //*(uint8_t*)(entry_mem + off) = 0xCC;
+                            hit_branch = true;
+                        }
+                    }
+                    printf("\n");
+                }
+                off += i->size;
+            }
+
+            cs_free(insn, count);
+        } else {
+            printf("ERROR: Failed to disassemble given code! final off: %llx (%lld)\n", off, off);
+            break;
+        }
+        if(hit_branch){
+            break;
+        }
+    }
+
+    cs_close(&handle);
+
+    print_gdt_entries(machine.main_memory().at(machine.get_special_registers().gdt.base), 7);
+    machine.print_exception_handlers();
+
+    //*(uint8_t*)entry_mem = 0xF1;
+    return 0;
+}
+
+
 
 int main(int argc, char** argv)
 {
@@ -88,6 +160,13 @@ int main(int argc, char** argv)
 		.executable_heap = dyn_elf.is_dynamic,
 	};
 	tinykvm::Machine master_vm {binary, options};
+
+    install_coverage_hooks(master_vm);
+
+	master_vm.install_output_handler([](tinykvm::vCPU& cpu, unsigned int io_port, unsigned int val) {
+        printf("got custom output %x %x\n", io_port, val);
+        return;
+    });
 	//master_vm.print_pagetables();
 	if (dyn_elf.is_dynamic) {
 		static const std::vector<std::string> allowed_readable_paths({
@@ -110,6 +189,7 @@ int main(int argc, char** argv)
 		});
 		master_vm.fds().set_open_readable_callback(
 			[&] (std::string& path) -> bool {
+            if(getenv("ALL_PATHS")) { return true; }
 				return std::find(allowed_readable_paths.begin(),
 					allowed_readable_paths.end(), path) != allowed_readable_paths.end();
 			}
@@ -118,7 +198,7 @@ int main(int argc, char** argv)
 
 	master_vm.setup_linux(
 		args,
-		{"LC_TYPE=C", "LC_ALL=C", "USER=root"});
+		{"LC_TYPE=C", "LC_ALL=C", "USER=root", "LD_BIND_NOW=1"});
 
 	const auto rsp = master_vm.stack_address();
 

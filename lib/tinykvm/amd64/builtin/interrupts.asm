@@ -22,6 +22,10 @@ ALIGN 0x8
 ALIGN 0x8
 	jmp .vm64_page_fault
 %endmacro
+%macro CPU_EXCEPT_BP 1
+ALIGN 0x8
+	jmp .vm64_bp
+%endmacro
 
 dw .vm64_syscall
 dw .vm64_gettimeofday
@@ -252,6 +256,17 @@ ALIGN 0x10
 .vm64_reentrycall:
 	o64 sysret
 
+.vm64_bp:
+	push rax
+	push rdi
+	;; long term we want the breakpoint interrupt to handle coverage items
+	;; completely in the guest, but for debugging emit a vmexit so we can tell
+	;; what's going on in the vmm.
+	out 256 + 32, eax
+	pop rdi
+	pop rax
+	iretq
+
 .vm64_page_fault:
 	push rax
 	push rdi
@@ -298,9 +313,9 @@ ALIGN 0x8
 	CPU_EXCEPT 0
 ALIGN 0x8
 .vm64_except1:
-	CPU_EXCEPT 1
+	CPU_EXCEPT_BP 1
 	CPU_EXCEPT 2
-	CPU_EXCEPT 3
+	CPU_EXCEPT_BP 3
 	CPU_EXCEPT 4
 	CPU_EXCEPT 5
 	CPU_EXCEPT 6

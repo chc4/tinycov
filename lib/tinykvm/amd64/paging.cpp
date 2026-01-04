@@ -199,11 +199,14 @@ uint64_t setup_amd64_paging(vMemory& memory,
 	/* Kernel code: Exceptions, system calls */
 	const uint64_t except_page = INTR_ASM_ADDR >> 12;
 	lowpage[except_page] = PDE64_PRESENT | PDE64_G | (memory.physbase + INTR_ASM_ADDR);
+	/* User mapping of kernel code, for int3 */
+	lowpage[except_page+1] = PDE64_PRESENT | PDE64_G | PDE64_USER | (memory.physbase + INTR_ASM_ADDR);
 
 	/* Exception (IST) stack */
 	const uint64_t ist_page = IST_ADDR >> 12;
 	lowpage[ist_page+0] = PDE64_PRESENT | PDE64_RW | PDE64_NX | (memory.physbase + IST_ADDR);
-	lowpage[ist_page+1] = 0; //PDE64_PRESENT | PDE64_RW | PDE64_NX | (memory.physbase + IST2_ADDR);
+	/* User Exception (IST2) stack */
+	lowpage[ist_page+1] = PDE64_PRESENT | PDE64_RW | PDE64_NX | PDE64_USER | (memory.physbase + IST2_ADDR);
 
 	/* Usercode page: Entry, exit */
 	const uint64_t user_page = USER_ASM_ADDR >> 12;

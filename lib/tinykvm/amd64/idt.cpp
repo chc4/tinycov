@@ -65,6 +65,14 @@ void set_exception_handler(void* area, uint8_t vec, uint64_t handler)
 	//idt.entry[vec].ist = (vec != 8) ? 1 : 2;
 }
 
+void set_exception_handler_user(void* area, uint8_t vec, uint64_t handler)
+{
+	auto& idt = *(IDT *)area;
+	set_entry(idt.entry[vec], handler, 0x2B, IDT_PRESENT | IDT_CPL3 | IDT_GATE_INTR);
+	/* Use second IST for user interrupts */
+	idt.entry[vec].ist = 2;
+}
+
 /* unsigned interrupts[] = { ... } */
 #include "builtin/kernel_assembly.h"
 static_assert(sizeof(interrupts) > 10 && sizeof(interrupts) <= 4096,
@@ -95,6 +103,10 @@ void setup_amd64_exceptions(uint64_t addr, void* area, void* except_area)
 	// Program the timer interrupt (which sends NMI)
 	offset += interrupt_header().vm64_except_size;
 	set_exception_handler(area, 32, offset);
+	// Install ring 3 -> ring 3 int3 handler.
+	// The 0x1000 is to use INST2 instead of INST so the code is user accessible..
+	//set_exception_handler_user(area, 3, addr + 0x1000 + (interrupt_header().vm64_exception * 3));
+	set_exception_handler_user(area, 3, addr + 0x1000 + interrupt_header().vm64_exception + (interrupt_header().vm64_except_size * 3));
 	// Install exception handling code
 	std::memcpy(except_area, interrupts, sizeof(interrupts));
 }
@@ -122,9 +134,9 @@ struct AMD64_Ex {
 static constexpr std::array<AMD64_Ex, 34> exceptions =
 {
 	AMD64_Ex{"Divide-by-zero Error", false},
-	AMD64_Ex{"Debug", false},
+	AMD64_Ex{"Debug", true},
 	AMD64_Ex{"Non-Maskable Interrupt", false},
-	AMD64_Ex{"Breakpoint", false},
+	AMD64_Ex{"Breakpoint", true},
 	AMD64_Ex{"Overflow", false},
 	AMD64_Ex{"Bound Range Exceeded", false},
 	AMD64_Ex{"Invalid Opcode", false},

@@ -44,7 +44,7 @@ void setup_amd64_tss(vMemory& memory)
 	tss.rsp1 = 0;
 	tss.rsp2 = 0;
 	tss.ist1 = ist_base + 0x1000;
-	tss.ist2 = ist_base + 0x800;
+	tss.ist2 = ist_base + 0x2000;
 	tss.iomap_base = 104; // unused
 
 	auto* gdt_ptr = memory.at(memory.physbase + GDT_ADDR);
@@ -53,7 +53,9 @@ void setup_amd64_tss(vMemory& memory)
 
 void setup_amd64_tss_smp(vMemory& memory)
 {
-	const auto ist_base = memory.physbase + IST_ADDR;
+    printf("we broke smp, fix this later\n");
+    return;
+	const auto ist_base = memory.physbase + IST2_ADDR;
 	auto* smp_tss_ptr = memory.at(memory.physbase + TSS_SMP_ADDR);
 
 	auto* tss = (AMD64_TSS *)smp_tss_ptr;
@@ -62,7 +64,8 @@ void setup_amd64_tss_smp(vMemory& memory)
 		tss[c].rsp0 = ist_base + TSS_SMP_STACK * (c + 1);
 		tss[c].rsp1 = 0;
 		tss[c].rsp2 = 0;
-		tss[c].ist1 = tss[c].rsp0;
+		tss[c].ist1 = 0;
+		tss[c].ist2 = 0;
 		tss[c].iomap_base = 104; // unused
 	}
 }
