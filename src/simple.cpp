@@ -1,6 +1,8 @@
 #include <tinykvm/machine.hpp>
 #include <tinykvm/common.hpp>
 #include <tinykvm/memory.hpp>
+#include <tinykvm/amd64/paging.hpp>
+#include <tinykvm/amd64/amd64.hpp>
 #include <linux/kvm.h>
 #include <tinykvm/amd64/gdt.hpp>
 #include <algorithm>
@@ -51,13 +53,45 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     uintptr_t inst_disp = pc % 0x1000;
     size_t start_page = (pc / 0x1000);
     size_t end_page = ((pc + inst->size) / 0x1000);
-    assert(start_page == end_page);
+    //assert(start_page == end_page);
+    if(start_page != end_page) {
+        // skip for now
+        return;
+    }
+
+    uint8_t trampoline_code[12] = {};
+    // Get the condition code from the original instruction
+    uint8_t condition_code = 0;
+    const char* mnemonic = inst->mnemonic;
+    if (strcmp(mnemonic, "je") == 0 || strcmp(mnemonic, "jz") == 0) condition_code = 0x4;
+    else if (strcmp(mnemonic, "jne") == 0 || strcmp(mnemonic, "jnz") == 0) condition_code = 0x5;
+    else if (strcmp(mnemonic, "ja") == 0 || strcmp(mnemonic, "jnbe") == 0) condition_code = 0x7;
+    else if (strcmp(mnemonic, "js") == 0) condition_code = 0x8;
+    else if (strcmp(mnemonic, "jns") == 0) condition_code = 0x9;
+    else if (strcmp(mnemonic, "jo") == 0) condition_code = 0x0;
+    else if (strcmp(mnemonic, "jno") == 0) condition_code = 0x1;
+    else if (strcmp(mnemonic, "jae") == 0 || strcmp(mnemonic, "jnb") == 0) condition_code = 0x3;
+    else if (strcmp(mnemonic, "jb") == 0 || strcmp(mnemonic, "jnae") == 0) condition_code = 0x2;
+    else if (strcmp(mnemonic, "jbe") == 0 || strcmp(mnemonic, "jna") == 0) condition_code = 0x6;
+    else if (strcmp(mnemonic, "jg") == 0 || strcmp(mnemonic, "jnle") == 0) condition_code = 0xF;
+    else if (strcmp(mnemonic, "jge") == 0 || strcmp(mnemonic, "jnl") == 0) condition_code = 0xD;
+    else if (strcmp(mnemonic, "jl") == 0 || strcmp(mnemonic, "jnge") == 0) condition_code = 0xC;
+    else if (strcmp(mnemonic, "jle") == 0 || strcmp(mnemonic, "jng") == 0) condition_code = 0xE;
+    else if (strcmp(mnemonic, "jp") == 0 || strcmp(mnemonic, "jpe") == 0) condition_code = 0xA;
+    // TODO: handle this properly
+    else if (strcmp(mnemonic, "jrcxz") == 0 || strcmp(mnemonic, "jnrcxz") == 0) return;
+    // lol no
+    else if (strcmp(mnemonic, "xbegin") == 0) return;
+    else {
+        printf("Unknown branch mnemonic: %s\n", mnemonic);
+        assert(false);
+    }
 
     struct TrampolinePage *page = nullptr;
 
     for(auto& candidate : trampoline) {
         bool overlap = false;
-        for(int i = 0; i < inst->size && !overlap; i++) {
+        for(int i = 0; i < sizeof(trampoline_code) && !overlap; i++) {
             if(candidate.present.contains((uint16_t)(inst_disp + i))) {
                 dprintf("h:%x present %x\n", candidate.host_addr, inst_disp + i);
                 // Something already present in this page
@@ -71,7 +105,13 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     }
     if(!page) {
         // We fellthough without finding a free trampoline slot
-        uint64_t guest_addr = cpu.machine().mmap_allocate(0x1000, PROT_EXEC, false);
+        uint64_t guest_addr = cpu.machine().mmap_allocate(0x1000, 0x7, false);
+        page_at(cpu.machine().main_memory(), guest_addr, [] (uint64_t addr, uint64_t& entry, size_t size) {
+            // Make the page executable by the user (There is probably a better way to do this?)
+            entry = entry & ~PDE64_NX;
+        });
+
+
         uintptr_t host_addr = (uintptr_t)cpu.machine().main_memory().at(guest_addr, 0x1000);
         memset((char*)host_addr, 0, 0x1000);
         dprintf("allocated new trampoline page @ h:%x g:%x\n", host_addr, guest_addr);
@@ -81,19 +121,37 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
             .present = {},
             .index = next_index,
         };
+        assert(next_index < 0x80);
         next_index += 1;
         trampoline.push_back(new_page);
         page = &trampoline.back();
     }
 
     // We have page and it doesn't have any overlapping data
+    // Write trampoline: jcc +5; jmp fallthrough; jmp target
+    trampoline_code[0] = 0x70 | condition_code;  // jcc +5
+    trampoline_code[1] = 0x05;                   // offset +5
+    // jmp fallthrough (5 bytes)
+    uint64_t target_fallthrough = pc + inst->size;
+    int64_t fallthrough_offset = target_fallthrough - (page->guest_addr + inst_disp + 7);
+    trampoline_code[2] = 0xE9;  // jmp rel32
+    *(int32_t*)(&trampoline_code[3]) = (int32_t)fallthrough_offset;
+    // jmp target (5 bytes)
+    uint64_t target_taken = inst->detail->x86.operands[0].imm;
+    int64_t taken_offset = target_taken - (page->guest_addr + inst_disp + 12);
+    trampoline_code[7] = 0xE9;  // jmp rel32
+    *(int32_t*)(&trampoline_code[8]) = (int32_t)taken_offset;
+
+
     int i;
     char* host_code = cpu.machine().main_memory().at(pc, 0x20);
-    for(i = 0; i < inst->size; i++) {
+    for(i = 0; i < sizeof(trampoline_code); i++) {
         // Mark the bytes we will use as present
         page->present.insert(inst_disp + i);
-        // Write the original instruction
-        *((char*)page->host_addr + inst_disp + i) = *(host_code + i);
+        // Write the trampoline
+        *((char*)page->host_addr + inst_disp + i) = trampoline_code[i];
+    }
+    for(i = 0; i < inst->size; i++) {
         // NOP out the actual branch
         *(host_code + i) = 0x90;
     }
@@ -106,6 +164,8 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
 
 }
 
+static std::set<uintptr_t> seen = {};
+static std::vector<uintptr_t> blocks {};
 static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
 
     csh handle;
@@ -114,10 +174,21 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
     if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK)
         return;
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
-    std::set<uintptr_t> seen {};
-    std::vector<uintptr_t> blocks {};
-    seen.insert(entry);
-    blocks.push_back(entry);
+
+    if(!seen.contains(entry)) {
+        seen.insert(entry);
+        blocks.push_back(entry);
+    }
+
+    auto add_exit = [](uint32_t dest) {
+        if(dest == 0) { return false; }
+
+        if(seen.contains(dest)) { return false; }
+        seen.insert(dest);
+        blocks.push_back(dest);
+        return true;
+    };
+
     while(blocks.size() > 0) {
         uintptr_t entry = blocks.at(blocks.size() - 1);
         blocks.pop_back();
@@ -131,6 +202,8 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
             if (count > 0) {
                 assert(count == 1);
                 size_t j;
+                uintptr_t dest = 0;
+
                 for (j = 0; j < count && !hit_branch; j++) {
                     cs_insn *i = &(insn[j]);
                     if(strcmp(i->mnemonic, "int3") == 0) {
@@ -151,28 +224,30 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
                     cs_detail *detail = i->detail;
                     if (detail->groups_count > 0) {
                         dprintf("\tinstruction group: ");
-                        uintptr_t dest = 0;
                         for (int n = 0; n < detail->groups_count; n++) {
                             dprintf("%s ", cs_group_name(handle, detail->groups[n]));
                             if(detail->groups[n] == cs_group_type::CS_GRP_CALL) {
                                 if(i->detail->x86.operands[0].type == X86_OP_IMM) {
                                     // Follow the branch
-                                    dest = i->detail->x86.operands[0].imm;
+                                    auto dest = i->detail->x86.operands[0].imm;
+                                    add_exit(dest);
                                     break;
                                 } else {
-                                    // Dynamic dispatch: for now just ignore it
+                                    // Dynamic dispatch: for now just ignore it?
                                     hit_branch = true;
                                     break;
                                 }
                             }
                             if(detail->groups[n] == cs_group_type::CS_GRP_BRANCH_RELATIVE) {
-                                dest = i->detail->x86.operands[0].imm;
+                                auto dest = i->detail->x86.operands[0].imm;
                                 dprintf(" x86_jmp! %x\n", dest);
                                 if(strcmp(i->mnemonic, "jmp") == 0) {
                                     // Just follow unconditional branch
+                                    add_exit(dest);
                                 } else {
-                                    // Hook the branch, but don't push successors: we
-                                    // will hook them when the branch is hit.
+                                    // Follow both sides of the branch
+                                    add_exit(i->address + i->size);
+                                    add_exit(dest);
                                     hook_branch(cpu, i->address, i);
                                     hit_branch = true;
                                     break;
@@ -180,13 +255,6 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
                             }
                         }
                         dprintf("\n");
-                        if(hit_branch) { continue; }
-                        if(dest == 0) { continue; }
-                        if(seen.contains(dest)) { continue; }
-                        dprintf("\n\t\t -> %x\n", dest);
-                        seen.insert(dest);
-                        blocks.push_back(dest);
-
                     }
                 }
 
@@ -240,69 +308,17 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         auto page = trampoline.at(index);
         assert(page.present.contains(inst_disp));
 
-        dprintf("trampoline h:%x contains\n", page.host_addr);
+        dprintf("trampoline h:%x g:%x contains\n", page.host_addr, page.guest_addr);
 
         host_code = (uint32_t*)(page.host_addr + inst_disp);
         dprintf("inst=%x\n", *host_code);
-        csh handle;
-        cs_insn *insn;
-        size_t count;
-        if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK)
-            return;
-        cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
-        count = cs_disasm(handle,
-                (const uint8_t*)(page.host_addr + inst_disp),
-                0x10,
-                pc,
-                1,
-                &insn);
-        assert(count == 1);
-        // By default, we fallthrough the branch.
-        uint64_t target = pc + 2;
+        uint32_t target = page.guest_addr + inst_disp;
 
-        auto evaluate_condition = [&](const char* mnemonic) -> bool {
-            bool cf = (rflags & X86_EFLAGS_CF) != 0;
-            bool zf = (rflags & X86_EFLAGS_ZF) != 0;
-            bool sf = (rflags & X86_EFLAGS_SF) != 0;
-            bool of = (rflags & X86_EFLAGS_OF) != 0;
-            if (strcmp(mnemonic, "je") == 0 || strcmp(mnemonic, "jz") == 0) {
-                return zf;
-            } else if (strcmp(mnemonic, "jne") == 0 || strcmp(mnemonic, "jnz") == 0) {
-                return !zf;
-            } else if (strcmp(mnemonic, "ja") == 0 || strcmp(mnemonic, "jnbe") == 0) {
-                return !cf && !zf;
-            } else if (strcmp(mnemonic, "jae") == 0 || strcmp(mnemonic, "jnb") == 0 || strcmp(mnemonic, "jnc") == 0) {
-                return !cf;
-            } else if (strcmp(mnemonic, "jb") == 0 || strcmp(mnemonic, "jnae") == 0 || strcmp(mnemonic, "jc") == 0) {
-                return cf;
-            } else if (strcmp(mnemonic, "jbe") == 0 || strcmp(mnemonic, "jna") == 0) {
-                return cf || zf;
-            } else if (strcmp(mnemonic, "jg") == 0 || strcmp(mnemonic, "jnle") == 0) {
-                return !zf && (sf == of);
-            } else if (strcmp(mnemonic, "jge") == 0 || strcmp(mnemonic, "jnl") == 0) {
-                return sf == of;
-            } else if (strcmp(mnemonic, "jl") == 0 || strcmp(mnemonic, "jnge") == 0) {
-                return sf != of;
-            } else if (strcmp(mnemonic, "jle") == 0 || strcmp(mnemonic, "jng") == 0) {
-                return zf || (sf != of);
-            } else {
-                assert(false);
-                return false; // Unknown
-            }
-        };
-        bool should_jump = evaluate_condition(insn->mnemonic);
-        if (should_jump) {
-            target = insn->detail->x86.operands[0].imm;
-            dprintf("hit %s -> taking branch to %llx\n", insn->mnemonic, target);
-        } else {
-            dprintf("hit %s -> not taking branch, fallthrough to %llx\n", insn->mnemonic, target);
-        }
-        printf("%x -> %x\n", pc, target);
+        //printf("%x %x\n", pc, rflags);
         cpu.registers().rax = target;
         cpu.set_registers(cpu.registers());
-        cs_close(&handle);
 
-        hook_block(cpu, target);
+        //hook_block(cpu, target);
 
         return;
     });
