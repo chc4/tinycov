@@ -92,6 +92,7 @@ void Machine::elf_loader(std::string_view binary, const MachineOptions& options)
 
 	const auto* phdr = (Elf64_Phdr*) (binary.data() + elf->e_phoff);
 	this->m_start_address = this->m_image_base + elf->e_entry;
+    printf("Loading ELF with base address of %p\n", this->m_image_base);
 	this->m_heap_address = 0x0;
 	uint64_t image_begin = ~0UL;
 

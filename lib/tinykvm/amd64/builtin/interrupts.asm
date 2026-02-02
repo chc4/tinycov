@@ -258,12 +258,12 @@ ALIGN 0x10
 
 .vm64_bp:
 	push rax
-	push rdi
 	;; long term we want the breakpoint interrupt to handle coverage items
 	;; completely in the guest, but for debugging emit a vmexit so we can tell
 	;; what's going on in the vmm.
+	mov rax, [rsp + 8]
 	out 256 + 32, eax
-	pop rdi
+	mov [rsp + 8], rax
 	pop rax
 	iretq
 
