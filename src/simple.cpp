@@ -19,7 +19,9 @@
 #include <tinykvm/rsp_client.hpp>
 #define GUEST_MEMORY   0x80000000  /* 2GB memory */
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
+#define COVERAGE_FRESH (0x80) // Bit used in the trampoline page selector to mark unhit hooks
 
+#define DEBUG 1
 #ifdef DEBUG
 #define dprintf printf
 #else
@@ -48,52 +50,14 @@ struct TrampolinePage {
 
 static std::vector<struct TrampolinePage> trampoline = {};
 static uint32_t next_index = 0;
-static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
-    dprintf("hooking @ %x\n", pc);
-    uintptr_t inst_disp = pc % 0x1000;
-    size_t start_page = (pc / 0x1000);
-    size_t end_page = ((pc + inst->size) / 0x1000);
-    //assert(start_page == end_page);
-    if(start_page != end_page) {
-        // skip for now
-        return;
-    }
 
-    uint8_t trampoline_code[12] = {};
-    // Get the condition code from the original instruction
-    uint8_t condition_code = 0;
-    const char* mnemonic = inst->mnemonic;
-    if (strcmp(mnemonic, "je") == 0 || strcmp(mnemonic, "jz") == 0) condition_code = 0x4;
-    else if (strcmp(mnemonic, "jne") == 0 || strcmp(mnemonic, "jnz") == 0) condition_code = 0x5;
-    else if (strcmp(mnemonic, "ja") == 0 || strcmp(mnemonic, "jnbe") == 0) condition_code = 0x7;
-    else if (strcmp(mnemonic, "js") == 0) condition_code = 0x8;
-    else if (strcmp(mnemonic, "jns") == 0) condition_code = 0x9;
-    else if (strcmp(mnemonic, "jo") == 0) condition_code = 0x0;
-    else if (strcmp(mnemonic, "jno") == 0) condition_code = 0x1;
-    else if (strcmp(mnemonic, "jae") == 0 || strcmp(mnemonic, "jnb") == 0) condition_code = 0x3;
-    else if (strcmp(mnemonic, "jb") == 0 || strcmp(mnemonic, "jnae") == 0) condition_code = 0x2;
-    else if (strcmp(mnemonic, "jbe") == 0 || strcmp(mnemonic, "jna") == 0) condition_code = 0x6;
-    else if (strcmp(mnemonic, "jg") == 0 || strcmp(mnemonic, "jnle") == 0) condition_code = 0xF;
-    else if (strcmp(mnemonic, "jge") == 0 || strcmp(mnemonic, "jnl") == 0) condition_code = 0xD;
-    else if (strcmp(mnemonic, "jl") == 0 || strcmp(mnemonic, "jnge") == 0) condition_code = 0xC;
-    else if (strcmp(mnemonic, "jle") == 0 || strcmp(mnemonic, "jng") == 0) condition_code = 0xE;
-    else if (strcmp(mnemonic, "jp") == 0 || strcmp(mnemonic, "jpe") == 0) condition_code = 0xA;
-    // TODO: handle this properly
-    else if (strcmp(mnemonic, "jrcxz") == 0 || strcmp(mnemonic, "jnrcxz") == 0) return;
-    // lol no
-    else if (strcmp(mnemonic, "xbegin") == 0) return;
-    else {
-        printf("Unknown branch mnemonic: %s\n", mnemonic);
-        assert(false);
-    }
-
+struct TrampolinePage *find_trampoline(tinykvm::vCPU& cpu, uint16_t disp, uint16_t len) {
     struct TrampolinePage *page = nullptr;
-
     for(auto& candidate : trampoline) {
         bool overlap = false;
-        for(int i = 0; i < sizeof(trampoline_code) && !overlap; i++) {
-            if(candidate.present.contains((uint16_t)(inst_disp + i))) {
-                dprintf("h:%x present %x\n", candidate.host_addr, inst_disp + i);
+        for(int i = 0; i < len && !overlap; i++) {
+            if(candidate.present.contains((uint16_t)(disp + i))) {
+                dprintf("h:%x present %x\n", candidate.host_addr, disp + i);
                 // Something already present in this page
                 overlap = true;
                 break;
@@ -126,6 +90,60 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
         trampoline.push_back(new_page);
         page = &trampoline.back();
     }
+    return page;
+}
+
+static void hook_disp(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
+    // Unlike the branch tracing we can't use trampoline code, because then
+    // the guest will observe the return address being the trampoline code instead
+    // of the correct functions...which will break things such as C++ exception
+    // unwinding.
+    // Instead, we emulate them entirely in the kernel guest: the ISR can push
+    // to the saved stack pointer and overwrite the saved RIP in order to turn the
+    // int3 into a call.
+}
+
+static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
+    // Install coverage hooks on all of the exits of a basic block
+    uint8_t trampoline_code[12] = {};
+    dprintf("hooking @ %x\n", pc);
+    uint16_t inst_disp = pc % 0x1000;
+    size_t start_page = (pc / 0x1000);
+    size_t end_page = ((pc + sizeof(trampoline_code)) / 0x1000);
+    //assert(start_page == end_page);
+    if(start_page != end_page) {
+        // skip for now
+        return;
+    }
+
+    // Get the condition code from the original instruction
+    uint8_t condition_code = 0;
+    const char* mnemonic = inst->mnemonic;
+    if (strcmp(mnemonic, "je") == 0 || strcmp(mnemonic, "jz") == 0) condition_code = 0x4;
+    else if (strcmp(mnemonic, "jne") == 0 || strcmp(mnemonic, "jnz") == 0) condition_code = 0x5;
+    else if (strcmp(mnemonic, "ja") == 0 || strcmp(mnemonic, "jnbe") == 0) condition_code = 0x7;
+    else if (strcmp(mnemonic, "js") == 0) condition_code = 0x8;
+    else if (strcmp(mnemonic, "jns") == 0) condition_code = 0x9;
+    else if (strcmp(mnemonic, "jo") == 0) condition_code = 0x0;
+    else if (strcmp(mnemonic, "jno") == 0) condition_code = 0x1;
+    else if (strcmp(mnemonic, "jae") == 0 || strcmp(mnemonic, "jnb") == 0) condition_code = 0x3;
+    else if (strcmp(mnemonic, "jb") == 0 || strcmp(mnemonic, "jnae") == 0) condition_code = 0x2;
+    else if (strcmp(mnemonic, "jbe") == 0 || strcmp(mnemonic, "jna") == 0) condition_code = 0x6;
+    else if (strcmp(mnemonic, "jg") == 0 || strcmp(mnemonic, "jnle") == 0) condition_code = 0xF;
+    else if (strcmp(mnemonic, "jge") == 0 || strcmp(mnemonic, "jnl") == 0) condition_code = 0xD;
+    else if (strcmp(mnemonic, "jl") == 0 || strcmp(mnemonic, "jnge") == 0) condition_code = 0xC;
+    else if (strcmp(mnemonic, "jle") == 0 || strcmp(mnemonic, "jng") == 0) condition_code = 0xE;
+    else if (strcmp(mnemonic, "jp") == 0 || strcmp(mnemonic, "jpe") == 0) condition_code = 0xA;
+    // TODO: handle this properly
+    else if (strcmp(mnemonic, "jrcxz") == 0 || strcmp(mnemonic, "jnrcxz") == 0) return;
+    // lol no
+    else if (strcmp(mnemonic, "xbegin") == 0) return;
+    else {
+        printf("Unknown branch mnemonic: %s\n", mnemonic);
+        assert(false);
+    }
+
+    struct TrampolinePage *page = find_trampoline(cpu, inst_disp, sizeof(trampoline_code));
 
     // We have page and it doesn't have any overlapping data
     // Write trampoline: jcc +5; jmp fallthrough; jmp target
@@ -142,6 +160,7 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     trampoline_code[7] = 0xE9;  // jmp rel32
     *(int32_t*)(&trampoline_code[8]) = (int32_t)taken_offset;
 
+    dprintf("hook coverage @ %p -> %p, %p\n", pc, target_fallthrough, target_taken);
 
     int i;
     char* host_code = cpu.machine().main_memory().at(pc, 0x20);
@@ -157,12 +176,11 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     }
     // Replace first NOP with int3
     *(host_code + 0) = 0xcc;
-    // Replace second byte with page selector
-    *(host_code + 1) = page->index;
+    // Replace second byte with page selector, and mark it as fresh
+    *(host_code + 1) = page->index | COVERAGE_FRESH;
     dprintf("marked present %x--%x\n", inst_disp, inst_disp + i);
-
-
 }
+
 
 static std::set<uintptr_t> seen = {};
 static std::vector<uintptr_t> blocks {};
@@ -246,8 +264,8 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
                                     add_exit(dest);
                                 } else {
                                     // Follow both sides of the branch
-                                    add_exit(i->address + i->size);
-                                    add_exit(dest);
+                                    //add_exit(i->address + i->size);
+                                    //add_exit(dest);
                                     hook_branch(cpu, i->address, i);
                                     hit_branch = true;
                                     break;
@@ -279,7 +297,29 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
     cs_close(&handle);
 }
 
+static void hit_branch(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *selector) {
+    // We hit the coverage hook of a block exit
+    uint32_t index = *selector & ~COVERAGE_FRESH;
+    // Find the two successors of this coverage branch by looking at our own trampoline
+    // instructions, which have displacements we can easily read out.
+    uintptr_t inst_disp = pc % 0x1000;
+    auto page = trampoline.at(index);
+    assert(page.present.contains(inst_disp));
 
+
+    uint8_t (*trampoline_code)[12] = (uint8_t(*)[12])(page.host_addr + inst_disp);
+
+    int32_t fallthrough_offset = *(int32_t*)&(*trampoline_code)[3];
+    int32_t taken_offset = *(int32_t*)&(*trampoline_code)[8];
+    uint32_t target_fallthrough = page.guest_addr + inst_disp + 7 + fallthrough_offset;
+    uint32_t target_taken = page.guest_addr + inst_disp + 12 + taken_offset;
+    dprintf("fresh coverage @ %p -> %p, %p\n", pc, target_fallthrough, target_taken);
+    *selector = *selector & ~COVERAGE_FRESH;
+
+    hook_block(cpu, target_fallthrough);
+    hook_block(cpu, target_taken);
+    return;
+}
 
 static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     uint64_t start_address = machine.registers().rip;
@@ -303,9 +343,16 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         uint64_t rflags = host_stack[3];
 
         // Load correct trampoline page based off of index
-        uint32_t index = *(uint8_t*)(((char*)host_code) + 1);
+        uint8_t *index = (uint8_t*)(((char*)host_code) + 1);
+        // Check if this is the first time a coverage hook was hit, in which case
+        // we need to push the coverage frontier forward
+        if((*index & COVERAGE_FRESH) != 0) {
+            hit_branch(cpu, pc, index);
+            assert((*index & COVERAGE_FRESH) == 0);
+        }
+
         uintptr_t inst_disp = pc % 0x1000;
-        auto page = trampoline.at(index);
+        auto page = trampoline.at(*index);
         assert(page.present.contains(inst_disp));
 
         dprintf("trampoline h:%x g:%x contains\n", page.host_addr, page.guest_addr);
@@ -313,11 +360,13 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         host_code = (uint32_t*)(page.host_addr + inst_disp);
         dprintf("inst=%x\n", *host_code);
         uint32_t target = page.guest_addr + inst_disp;
-
-        //printf("%x %x\n", pc, rflags);
+        printf("%x %x\n", pc, rflags);
         cpu.registers().rax = target;
         cpu.set_registers(cpu.registers());
 
+        // TODO: probably something smarter than this. use 0xF1 interrupts to mark
+        // that we should push the coverage frontier lazily? | 0x80 on the trampoline page index?
+        // having to rewrite the entire binary when we load it is the slowest bit.
         //hook_block(cpu, target);
 
         return;
