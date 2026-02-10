@@ -1,3 +1,4 @@
+#undef NDEBUG
 #include <tinykvm/machine.hpp>
 #include <tinykvm/common.hpp>
 #include <tinykvm/memory.hpp>
@@ -15,18 +16,23 @@
 #include <asm/processor-flags.h>
 
 #include <capstone/capstone.h>
+#include <roaring.hh>
 
 #include <tinykvm/rsp_client.hpp>
 #define GUEST_MEMORY   0x80000000  /* 2GB memory */
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
-#define COVERAGE_FRESH (0x80) // Bit used in the trampoline page selector to mark unhit hooks
+// Trampoline selector bits
+#define COVERAGE_FRESH (0x80) // Mark unhit hooks
+#define COVERAGE_DYNCALL (0x40) // Mark dynamic dispatch instructions
 
-#define DEBUG 1
+#define EMIT_COVERAGE 1
+//#define DEBUG 1
 #ifdef DEBUG
 #define dprintf printf
 #else
 #define dprintf(...) ((void)0)
 #endif
+
 
 static uint64_t verify_exists(tinykvm::Machine& vm, const char* name)
 {
@@ -44,12 +50,22 @@ inline long nanodiff(timespec start_time, timespec end_time);
 struct TrampolinePage {
     uintptr_t host_addr;
     uintptr_t guest_addr;
-    std::set<uint16_t> present;
+    roaring::Roaring present;
     uint32_t index;
 };
 
 static std::vector<struct TrampolinePage> trampoline = {};
 static uint32_t next_index = 0;
+
+
+void hexdump(tinykvm::vCPU& cpu, uintptr_t data, uintptr_t len) {
+    char* mem = cpu.machine().main_memory().at(0x21ef44, 16);
+    dprintf("%x: ", data);
+    for(int i = 0; i < 16; i++) {
+        dprintf("%02x ", (unsigned char)mem[i]);
+    }
+    dprintf("\n");
+}
 
 struct TrampolinePage *find_trampoline(tinykvm::vCPU& cpu, uint16_t disp, uint16_t len) {
     struct TrampolinePage *page = nullptr;
@@ -85,7 +101,7 @@ struct TrampolinePage *find_trampoline(tinykvm::vCPU& cpu, uint16_t disp, uint16
             .present = {},
             .index = next_index,
         };
-        assert(next_index < 0x80);
+        assert(next_index < 0x40);
         next_index += 1;
         trampoline.push_back(new_page);
         page = &trampoline.back();
@@ -93,18 +109,8 @@ struct TrampolinePage *find_trampoline(tinykvm::vCPU& cpu, uint16_t disp, uint16
     return page;
 }
 
-static void hook_disp(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
-    // Unlike the branch tracing we can't use trampoline code, because then
-    // the guest will observe the return address being the trampoline code instead
-    // of the correct functions...which will break things such as C++ exception
-    // unwinding.
-    // Instead, we emulate them entirely in the kernel guest: the ISR can push
-    // to the saved stack pointer and overwrite the saved RIP in order to turn the
-    // int3 into a call.
-}
-
 static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
-    // Install coverage hooks on all of the exits of a basic block
+    // Install coverage hook on a branch exit of a basic block
     uint8_t trampoline_code[12] = {};
     dprintf("hooking @ %x\n", pc);
     uint16_t inst_disp = pc % 0x1000;
@@ -166,7 +172,7 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     char* host_code = cpu.machine().main_memory().at(pc, 0x20);
     for(i = 0; i < sizeof(trampoline_code); i++) {
         // Mark the bytes we will use as present
-        page->present.insert(inst_disp + i);
+        page->present.add(inst_disp + i);
         // Write the trampoline
         *((char*)page->host_addr + inst_disp + i) = trampoline_code[i];
     }
@@ -181,8 +187,70 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     dprintf("marked present %x--%x\n", inst_disp, inst_disp + i);
 }
 
+static void hook_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
+    // Install a coverage hook on a dynamic dispatch call exit of a basic block
+    // Unlike branch tracing we can't use trampoline code, because then the
+    // guest will observe the return address being the trampoline code instead
+    // of the correct functions...which will break things such as C++ exception
+    // unwinding.
+    // Instead, we emulate some of the call in the kernel: we push the return address
+    // from the replaced call instruction, and then redirect to the trampoline
+    // which has the same dynamic dispatch but with a jump instead: this means
+    // we don't need to figure out how to emulate the dynamic dispatch in the kernel.
+    uint8_t trampoline_code[inst->size];
+    memcpy(trampoline_code, inst->bytes, inst->size);
 
-static std::set<uintptr_t> seen = {};
+    dprintf("hooking dyncall @ %x: %s %s\n", pc, inst->mnemonic, inst->op_str);
+    uint16_t inst_disp = pc % 0x1000;
+    size_t start_page = (pc / 0x1000);
+    size_t end_page = ((pc + sizeof(trampoline_code)) / 0x1000);
+    //assert(start_page == end_page);
+    if(start_page != end_page) {
+        // skip for now
+        return;
+    }
+
+    if(std::string(inst->op_str).find("rip") != std::string::npos) {
+        dprintf("rip-relative dyncall, bailing");
+        return;
+    }
+
+    struct TrampolinePage *page = find_trampoline(cpu, inst_disp, sizeof(trampoline_code));
+
+    bool hit = false;
+    for(int i = 0; i < sizeof(trampoline_code); i++) {
+        // Look for the 0xFF opcode byte, which is after any prefix bytes.
+        if(trampoline_code[i] != 0xFF) { continue; }
+        uint8_t modrm = trampoline_code[i + 1];
+        // Change the reg field of the ModR/M byte
+        uint8_t reg = (modrm >> 3) & 0x07;
+        assert(reg == 2); // Check it's a call (2)
+        trampoline_code[i + 1] = (modrm & 0xC7) | (4 << 3);  // Clear reg field, set to jump (4)
+        hit = true;
+        break;
+    }
+    assert(hit);
+
+    char* host_code = cpu.machine().main_memory().at(pc, 0x20);
+    for(int i = 0; i < sizeof(trampoline_code); i++) {
+        // Mark the bytes we will use as present
+        page->present.add(inst_disp + i);
+        // Write the trampoline
+        *((char*)page->host_addr + inst_disp + i) = trampoline_code[i];
+    }
+    for(int i = 0; i < inst->size; i++) {
+        // NOP out the actual branch
+        *(host_code + i) = 0x90;
+    }
+    // Replace first NOP with int3
+    *(host_code + 0) = 0xcc;
+    // Replace second byte with page selector, and mark it as fresh and a dynamic dispatch
+    *(host_code + 1) = page->index | COVERAGE_FRESH | COVERAGE_DYNCALL;
+    dprintf("marked present %x--%x\n", inst_disp, inst_disp + (uint32_t)sizeof(trampoline_code));
+    return;
+}
+
+static roaring::Roaring seen = {};
 static std::vector<uintptr_t> blocks {};
 static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
 
@@ -194,15 +262,17 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
 
     if(!seen.contains(entry)) {
-        seen.insert(entry);
+        seen.add(entry);
         blocks.push_back(entry);
+    } else {
+        return;
     }
 
     auto add_exit = [](uint32_t dest) {
         if(dest == 0) { return false; }
 
         if(seen.contains(dest)) { return false; }
-        seen.insert(dest);
+        seen.add(dest);
         blocks.push_back(dest);
         return true;
     };
@@ -252,6 +322,7 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
                                     break;
                                 } else {
                                     // Dynamic dispatch: for now just ignore it?
+                                    hook_dyncall(cpu, i->address, i);
                                     hit_branch = true;
                                     break;
                                 }
@@ -288,17 +359,11 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
         }
     }
 
-    char* mem = cpu.machine().main_memory().at(0x4134b9, 16);
-    for(int i = 0; i < 16; i++) {
-        dprintf("%02x ", (unsigned char)mem[i]);
-    }
-    dprintf("\n");
-
     cs_close(&handle);
 }
 
-static void hit_branch(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *selector) {
-    // We hit the coverage hook of a block exit
+static void hit_fresh_branch(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *selector) {
+    // We hit the coverage hook of a block exit for the first time
     uint32_t index = *selector & ~COVERAGE_FRESH;
     // Find the two successors of this coverage branch by looking at our own trampoline
     // instructions, which have displacements we can easily read out.
@@ -321,6 +386,128 @@ static void hit_branch(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *selector) {
     return;
 }
 
+// Some Claude written slop to resolve dynamic jump targets
+/**
+ * Get register value from state
+ */
+uint64_t get_register_value(const tinykvm::tinykvm_x86regs *regs, x86_reg reg) {
+    switch (reg) {
+        case X86_REG_RAX: return regs->rax;
+        case X86_REG_RBX: return regs->rbx;
+        case X86_REG_RCX: return regs->rcx;
+        case X86_REG_RDX: return regs->rdx;
+        case X86_REG_RSI: return regs->rsi;
+        case X86_REG_RDI: return regs->rdi;
+        case X86_REG_RBP: return regs->rbp;
+        case X86_REG_RSP: return regs->rsp;
+        case X86_REG_R8:  return regs->r8;
+        case X86_REG_R9:  return regs->r9;
+        case X86_REG_R10: return regs->r10;
+        case X86_REG_R11: return regs->r11;
+        case X86_REG_R12: return regs->r12;
+        case X86_REG_R13: return regs->r13;
+        case X86_REG_R14: return regs->r14;
+        case X86_REG_R15: return regs->r15;
+        case X86_REG_RIP: return regs->rip;
+
+        // 32-bit registers (zero-extended)
+        case X86_REG_EAX: return regs->rax & 0xFFFFFFFF;
+        case X86_REG_EBX: return regs->rbx & 0xFFFFFFFF;
+        case X86_REG_ECX: return regs->rcx & 0xFFFFFFFF;
+        case X86_REG_EDX: return regs->rdx & 0xFFFFFFFF;
+        case X86_REG_ESI: return regs->rsi & 0xFFFFFFFF;
+        case X86_REG_EDI: return regs->rdi & 0xFFFFFFFF;
+        case X86_REG_EBP: return regs->rbp & 0xFFFFFFFF;
+        case X86_REG_ESP: return regs->rsp & 0xFFFFFFFF;
+
+        case X86_REG_INVALID:
+        default:
+            assert(false);
+            return 0;
+    }
+}
+
+/**
+ * Calculate the concrete jump/call target given instruction and register state.
+ * 
+ * @param insn Capstone instruction (must be call or jmp)
+ * @param regs Register state
+ * @param target Output: calculated target address
+ * @param read_memory Callback to read memory (can be NULL if not needed)
+ * @param user_data Passed to read_memory callback
+ * @return 0 on success, -1 on error
+ */
+typedef int (*read_memory_fn)(uint64_t address, void *buffer, size_t size, void *user_data);
+
+int resolve_target(tinykvm::vMemory& memory, cs_insn *insn, tinykvm::tinykvm_x86regs *regs, uint64_t *target) {
+    cs_x86_op *op = &insn->detail->x86.operands[0];
+
+    switch (op->type) {
+        case X86_OP_REG:
+            *target = get_register_value(regs, op->reg);
+            return 0;
+
+        case X86_OP_IMM:
+            *target = op->imm;
+            return 0;
+
+        case X86_OP_MEM: {
+            uint64_t addr = op->mem.disp;
+            if (op->mem.base != X86_REG_INVALID)
+                addr += get_register_value(regs, op->mem.base);
+            if (op->mem.index != X86_REG_INVALID)
+                addr += get_register_value(regs, op->mem.index) * op->mem.scale;
+
+            // Now read from memory at 'addr'
+            *target = *(uint64_t*)memory.at(addr);  // or your memory reader
+            return 0;
+        }
+    }
+    assert(false);
+    return -1;
+}
+
+static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, uint8_t *selector) {
+    auto guest_rsp = cpu.registers().rsp;
+    auto host_stack = (uint64_t*)cpu.machine().main_memory().at(guest_rsp, 0x30);
+    // guest_rsp is the guest *kernel* stack. we need to get the guest user rsp
+    // from the pushed exception.
+    auto guest_user_rax = host_stack[0];
+    auto guest_user_rsp = host_stack[4];
+    dprintf("guest_user_rsp %p\n", guest_user_rsp);
+    hexdump(cpu, guest_user_rsp, 0x20);
+    // Push to the user stack
+    guest_user_rsp = guest_user_rsp - sizeof(uintptr_t);
+    auto host_ret = (uint64_t*)cpu.machine().main_memory().at(guest_user_rsp, sizeof(uintptr_t));
+    *host_ret = pc+2;
+    host_stack[4] = guest_user_rsp;
+
+    // ugh this doesn't even work well, because we can't resolve the call target to
+    // follow and push the coverage frontier forward, or record in our coverage map...
+    // TODO: jit an assembly stub in the trampoline pages to resolve the dyncall target?
+    // idk what else we can do here unfortunately
+    csh handle;
+    cs_insn *insn;
+
+    cs_open(CS_ARCH_X86, CS_MODE_64, &handle);
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+
+    assert(cs_disasm(handle, code, 0x20, pc, 1, &insn) > 0);
+
+    auto regs = cpu.registers();
+    regs.rax = guest_user_rax;
+    regs.rsp = guest_user_rsp;
+    regs.rip = pc;
+    uint64_t target = 0;
+    assert(resolve_target(cpu.machine().main_memory(), insn, &regs, &target) == 0);
+
+#ifdef EMIT_COVERAGE
+    printf("dyncall %p -> %p\n", pc, target);
+#endif
+    hook_block(cpu, target);
+    return target;
+}
+
 static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     uint64_t start_address = machine.registers().rip;
     dprintf("elf start @ %p\n", start_address);
@@ -339,7 +526,8 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         dprintf("custom io handler, val=%llx\n", val);
         uint32_t pc = val - 1; // INT3 advances by one byte
         auto host_code = (uint32_t*)cpu.machine().main_memory().at(pc, 0x10);
-        auto host_stack = (uint64_t*)cpu.machine().main_memory().at(cpu.registers().rsp, 0x30);
+        auto guest_rsp = cpu.registers().rsp;
+        auto host_stack = (uint64_t*)cpu.machine().main_memory().at(guest_rsp, 0x30);
         uint64_t rflags = host_stack[3];
 
         // Load correct trampoline page based off of index
@@ -347,12 +535,19 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         // Check if this is the first time a coverage hook was hit, in which case
         // we need to push the coverage frontier forward
         if((*index & COVERAGE_FRESH) != 0) {
-            hit_branch(cpu, pc, index);
+            if((*index & COVERAGE_DYNCALL) != 0) {
+                // TODO: hit_fresh_dyncall?
+                *index = *index & ~COVERAGE_FRESH;
+            } else {
+                hit_fresh_branch(cpu, pc, index);
+            }
             assert((*index & COVERAGE_FRESH) == 0);
         }
 
+
+        uint8_t page_index = *index & ~COVERAGE_DYNCALL;
         uintptr_t inst_disp = pc % 0x1000;
-        auto page = trampoline.at(*index);
+        auto page = trampoline.at(page_index);
         assert(page.present.contains(inst_disp));
 
         dprintf("trampoline h:%x g:%x contains\n", page.host_addr, page.guest_addr);
@@ -360,7 +555,15 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         host_code = (uint32_t*)(page.host_addr + inst_disp);
         dprintf("inst=%x\n", *host_code);
         uint32_t target = page.guest_addr + inst_disp;
+
+#ifdef EMIT_COVERAGE
         printf("%x %x\n", pc, rflags);
+#endif
+
+        if((*index & COVERAGE_DYNCALL) != 0) {
+            target = hit_dyncall(cpu, pc, (uint8_t*)host_code, index);
+        }
+
         cpu.registers().rax = target;
         cpu.set_registers(cpu.registers());
 

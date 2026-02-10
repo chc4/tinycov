@@ -50,7 +50,7 @@ add_library(tinykvm STATIC ${SOURCES})
 target_compile_definitions(tinykvm PUBLIC _GNU_SOURCE=1)
 target_include_directories(tinykvm PUBLIC .)
 target_compile_features(tinykvm PUBLIC cxx_std_20)
-target_link_libraries(tinykvm PUBLIC pthread rt capstone)
+target_link_libraries(tinykvm PUBLIC pthread rt capstone roaring)
 
 set_source_files_properties(
 	tinykvm/page_streaming.cpp
@@ -72,4 +72,11 @@ FetchContent_Declare(
     GIT_TAG 5.0.1
 )
 
+FetchContent_Declare(
+    roaring
+    GIT_REPOSITORY https://github.com/RoaringBitmap/CRoaring.git
+    GIT_TAG v2.1.2  # Use latest stable version
+)
+
+FetchContent_MakeAvailable(roaring)
 FetchContent_MakeAvailable(capstone)
