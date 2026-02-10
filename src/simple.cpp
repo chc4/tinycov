@@ -22,8 +22,13 @@
 #define GUEST_MEMORY   0x80000000  /* 2GB memory */
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
 // Trampoline selector bits
-#define COVERAGE_FRESH (0x80) // Mark unhit hooks
-#define COVERAGE_DYNCALL (0x40) // Mark dynamic dispatch instructions
+// We will never have a FRESH DYNJUMP, because dynamic dispatch hooks must always
+// be considered fresh: we always need to try and follow the targets at runtime.
+#define COVERAGE_FRESH (0x80) // Mark unhit branch hooks
+#define COVERAGE_DYNJUMP (0x40) // Mark dynamic dispatch jump instructions
+#define COVERAGE_DYNCALL (0xc0) // Mark dynamic dispatch call instructions
+#define COVERAGE_BITS (COVERAGE_FRESH | COVERAGE_DYNJUMP | COVERAGE_DYNCALL)
+#define TRAMPOLINE_SIZE (0x1000 - 12) // Number of bytes in each trampoline page
 
 #define EMIT_COVERAGE 1
 //#define DEBUG 1
@@ -113,14 +118,12 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     // Install coverage hook on a branch exit of a basic block
     uint8_t trampoline_code[12] = {};
     dprintf("hooking @ %x\n", pc);
-    uint16_t inst_disp = pc % 0x1000;
-    size_t start_page = (pc / 0x1000);
-    size_t end_page = ((pc + sizeof(trampoline_code)) / 0x1000);
+    uint16_t inst_disp = pc % TRAMPOLINE_SIZE;
+    size_t start_page = (pc / TRAMPOLINE_SIZE);
     //assert(start_page == end_page);
-    if(start_page != end_page) {
-        // skip for now
-        return;
-    }
+    //if(start_page != end_page) {
+    //    return;
+    //}
 
     // Get the condition code from the original instruction
     uint8_t condition_code = 0;
@@ -201,14 +204,11 @@ static void hook_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     memcpy(trampoline_code, inst->bytes, inst->size);
 
     dprintf("hooking dyncall @ %x: %s %s\n", pc, inst->mnemonic, inst->op_str);
-    uint16_t inst_disp = pc % 0x1000;
-    size_t start_page = (pc / 0x1000);
-    size_t end_page = ((pc + sizeof(trampoline_code)) / 0x1000);
+    uint16_t inst_disp = pc % TRAMPOLINE_SIZE;
     //assert(start_page == end_page);
-    if(start_page != end_page) {
-        // skip for now
-        return;
-    }
+    //if(start_page != end_page) {
+    //    return;
+    //}
 
     if(std::string(inst->op_str).find("rip") != std::string::npos) {
         dprintf("rip-relative dyncall, bailing");
@@ -245,7 +245,7 @@ static void hook_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     // Replace first NOP with int3
     *(host_code + 0) = 0xcc;
     // Replace second byte with page selector, and mark it as fresh and a dynamic dispatch
-    *(host_code + 1) = page->index | COVERAGE_FRESH | COVERAGE_DYNCALL;
+    *(host_code + 1) = page->index | COVERAGE_DYNCALL;
     dprintf("marked present %x--%x\n", inst_disp, inst_disp + (uint32_t)sizeof(trampoline_code));
     return;
 }
@@ -327,17 +327,25 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
                                     break;
                                 }
                             }
-                            if(detail->groups[n] == cs_group_type::CS_GRP_BRANCH_RELATIVE) {
-                                auto dest = i->detail->x86.operands[0].imm;
-                                dprintf(" x86_jmp! %x\n", dest);
-                                if(strcmp(i->mnemonic, "jmp") == 0) {
-                                    // Just follow unconditional branch
-                                    add_exit(dest);
+                            if(detail->groups[n] == cs_group_type::CS_GRP_JUMP) {
+                                if(i->detail->x86.operands[0].type == X86_OP_IMM) {
+                                    auto dest = i->detail->x86.operands[0].imm;
+                                    dprintf(" x86_jmp! %x\n", dest);
+                                    if(strcmp(i->mnemonic, "jmp") == 0) {
+                                        // Just follow unconditional branch
+                                        add_exit(dest);
+                                        break;
+                                    } else {
+                                        // Follow both sides of the branch
+                                        //add_exit(i->address + i->size);
+                                        //add_exit(dest);
+                                        hook_branch(cpu, i->address, i);
+                                        hit_branch = true;
+                                        break;
+                                    }
                                 } else {
-                                    // Follow both sides of the branch
-                                    //add_exit(i->address + i->size);
-                                    //add_exit(dest);
-                                    hook_branch(cpu, i->address, i);
+                                    //hook_dynjump(cpu, i->address, i);
+                                    //assert(false);
                                     hit_branch = true;
                                     break;
                                 }
@@ -367,7 +375,7 @@ static void hit_fresh_branch(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *selector
     uint32_t index = *selector & ~COVERAGE_FRESH;
     // Find the two successors of this coverage branch by looking at our own trampoline
     // instructions, which have displacements we can easily read out.
-    uintptr_t inst_disp = pc % 0x1000;
+    uintptr_t inst_disp = pc % TRAMPOLINE_SIZE;
     auto page = trampoline.at(index);
     assert(page.present.contains(inst_disp));
 
@@ -492,7 +500,7 @@ static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, ui
     cs_open(CS_ARCH_X86, CS_MODE_64, &handle);
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
 
-    assert(cs_disasm(handle, code, 0x20, pc, 1, &insn) > 0);
+    assert(cs_disasm(handle, code, 0x20, pc, 1, &insn) == 1);
 
     auto regs = cpu.registers();
     regs.rax = guest_user_rax;
@@ -500,6 +508,7 @@ static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, ui
     regs.rip = pc;
     uint64_t target = 0;
     assert(resolve_target(cpu.machine().main_memory(), insn, &regs, &target) == 0);
+    cs_free(insn, 1);
 
 #ifdef EMIT_COVERAGE
     printf("dyncall %p -> %p\n", pc, target);
@@ -530,23 +539,17 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         auto host_stack = (uint64_t*)cpu.machine().main_memory().at(guest_rsp, 0x30);
         uint64_t rflags = host_stack[3];
 
-        // Load correct trampoline page based off of index
+        // Load trampoline page index
         uint8_t *index = (uint8_t*)(((char*)host_code) + 1);
         // Check if this is the first time a coverage hook was hit, in which case
         // we need to push the coverage frontier forward
-        if((*index & COVERAGE_FRESH) != 0) {
-            if((*index & COVERAGE_DYNCALL) != 0) {
-                // TODO: hit_fresh_dyncall?
-                *index = *index & ~COVERAGE_FRESH;
-            } else {
-                hit_fresh_branch(cpu, pc, index);
-            }
+        if((*index & COVERAGE_BITS) == COVERAGE_FRESH) {
+            hit_fresh_branch(cpu, pc, index);
             assert((*index & COVERAGE_FRESH) == 0);
         }
 
-
-        uint8_t page_index = *index & ~COVERAGE_DYNCALL;
-        uintptr_t inst_disp = pc % 0x1000;
+        uint8_t page_index = *index & ~COVERAGE_BITS;
+        uintptr_t inst_disp = pc % TRAMPOLINE_SIZE;
         auto page = trampoline.at(page_index);
         assert(page.present.contains(inst_disp));
 
@@ -560,23 +563,18 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         printf("%x %x\n", pc, rflags);
 #endif
 
-        if((*index & COVERAGE_DYNCALL) != 0) {
+        if((*index & COVERAGE_BITS) == COVERAGE_DYNCALL) {
             target = hit_dyncall(cpu, pc, (uint8_t*)host_code, index);
+        } else if((*index & COVERAGE_BITS) == COVERAGE_DYNJUMP) {
+            assert(false);
         }
 
         cpu.registers().rax = target;
         cpu.set_registers(cpu.registers());
 
-        // TODO: probably something smarter than this. use 0xF1 interrupts to mark
-        // that we should push the coverage frontier lazily? | 0x80 on the trampoline page index?
-        // having to rewrite the entire binary when we load it is the slowest bit.
-        //hook_block(cpu, target);
-
         return;
     });
 
-
-    //*(uint8_t*)entry_mem = 0xF1;
     return 0;
 }
 
@@ -648,6 +646,7 @@ int main(int argc, char** argv)
         .executable_heap = dyn_elf.is_dynamic,
     };
     tinykvm::Machine master_vm {binary, options};
+    master_vm.set_verbose_mmap_syscalls(true);
 
     //master_vm.print_pagetables();
     if (dyn_elf.is_dynamic) {
