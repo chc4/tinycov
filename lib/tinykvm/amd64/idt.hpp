@@ -19,13 +19,12 @@ struct iasm_header {
 	uint16_t vm64_exception;
 	uint16_t vm64_except_size;
 	uint16_t vm64_dso;
-	uint16_t vm64_size;
 	uint16_t vm64_remote_return_addr;
 	uint32_t reserved1;
 
 	uint64_t translated_vm_syscall(const vMemory& memory) const noexcept
 	{
-		return memory.physbase + INTR_ASM_ADDR + vm64_syscall;
+		return vm64_syscall;
 	}
 };
 const iasm_header& interrupt_header();

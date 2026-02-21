@@ -275,7 +275,7 @@ long vCPU::run_once()
 				auto& memory = machine().main_memory();
 				if (UNLIKELY(regs.rip >= memory.physbase + INTR_ASM_ADDR+0x1000)) {
 					Machine::machine_exception("Security violation", intr);
-				} else if (UNLIKELY(addr < 0x2000)) {
+				} else if (UNLIKELY(addr < 0x5000)) {
 					/* Kernel space page fault */
 					this->handle_exception(intr);
 					machine().remote_disconnect();

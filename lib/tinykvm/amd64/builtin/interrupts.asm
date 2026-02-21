@@ -32,7 +32,7 @@ dw .vm64_gettimeofday
 dw .vm64_exception
 dw .vm64_except1 - .vm64_exception
 dw .vm64_dso
-dw _guest_end
+
 .vm64_remote_return_addr:
 	dw 0x0   ;; Return address after remote call
 dd 0x0       ;; Reserved/Padding

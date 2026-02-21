@@ -98,8 +98,8 @@ void setup_amd64_exception_regs(struct kvm_sregs& sregs, uint64_t addr)
 void setup_amd64_exceptions(uint64_t addr, void* area, void* except_area)
 {
 	uint64_t offset = interrupt_header().vm64_exception;
-	uint64_t size = interrupt_header().vm64_size - addr;
-	printf("vm64_excepton offset %x, size = %x\n", offset, size);
+	printf("vm64_excepton offset %x\n", offset);
+	printf("except size %x\n", interrupt_header().vm64_except_size);
 	for (int i = 0; i <= 20; i++) {
 		if (i == 15) continue;
 		//printf("Exception handler %d at 0x%lX\n", i, offset);
@@ -111,9 +111,10 @@ void setup_amd64_exceptions(uint64_t addr, void* area, void* except_area)
 	set_exception_handler(area, 32, offset);
 	// Install ring 3 -> ring 3 int3 handler.
 	// The 0x1000 is to use the PDE64_USER mapping instead of the kernel one.
-	assert(size <= 0x1000);
-	set_exception_handler_user(area, 3, 0x1000 + interrupt_header().vm64_exception + interrupt_header().vm64_except_size * 3 );
+	set_exception_handler_user(area, 3, 0x1000 + interrupt_header().vm64_exception + interrupt_header().vm64_except_size * 3);
 	// Install exception handling code
+	assert(INTERRUPTS_SIZE <= 0x1000);
+	printf("DEBUG %x %x %x\n", offset, (size_t)&_binary_interrupts_bin_start, INTERRUPTS_SIZE);
 	std::memcpy(except_area, _binary_interrupts_bin_start, INTERRUPTS_SIZE);
 }
 

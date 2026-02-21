@@ -187,7 +187,7 @@ void vCPU::init(int id, Machine& machine, const MachineOptions& options)
 	msrs.entries[0].index = AMD64_MSR_STAR;
 	msrs.entries[1].index = AMD64_MSR_LSTAR;
 	msrs.entries[0].data  = (0x8LL << 32) | (0x1BLL << 48);
-	msrs.entries[1].data  = interrupt_header().translated_vm_syscall(machine.main_memory());
+	msrs.entries[1].data  = interrupt_header().vm64_syscall;
 
 	if (!this->machine().is_forked())
 	{
@@ -256,7 +256,7 @@ void vCPU::smp_init(int id, Machine& machine)
 	msrs.entries[0].index = AMD64_MSR_STAR;
 	msrs.entries[1].index = AMD64_MSR_LSTAR;
 	msrs.entries[0].data  = (0x8LL << 32) | (0x1BLL << 48);
-	msrs.entries[1].data  = interrupt_header().translated_vm_syscall(memory);
+	msrs.entries[1].data  = interrupt_header().vm64_syscall;
 
 	if (ioctl(this->fd, KVM_SET_MSRS, &msrs) < (int)msrs.nmsrs) {
 		Machine::machine_exception("KVM_SET_MSRS: failed to set STAR/LSTAR");

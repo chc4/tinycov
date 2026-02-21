@@ -7,6 +7,4 @@ SECTIONS {
     .data : { *(.data) }
     .rodata : { *(.rodata) }
     .bss : { *(.bss) }
-
-    _guest_end = .;
 }

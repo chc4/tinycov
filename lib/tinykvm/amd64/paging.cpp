@@ -950,7 +950,7 @@ char * readable_page_at(const vMemory& memory, uint64_t addr, uint64_t flags)
 
 void memory_exception(const char* msg, uint64_t addr, uint64_t sz)
 {
-	throw MemoryException(msg, addr, sz);
+    throw MemoryException(msg, addr, sz);
 }
 
 void WritablePage::set_dirty()
