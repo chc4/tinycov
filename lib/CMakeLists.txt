@@ -52,6 +52,10 @@ target_include_directories(tinykvm PUBLIC .)
 target_compile_features(tinykvm PUBLIC cxx_std_20)
 target_link_libraries(tinykvm PUBLIC pthread rt capstone roaring)
 
+if (TINYKVM_ARCH STREQUAL "AMD64")
+	add_subdirectory(tinykvm/amd64/builtin)
+endif()
+
 set_source_files_properties(
 	tinykvm/page_streaming.cpp
 	PROPERTIES COMPILE_FLAGS -mavx2)
@@ -64,6 +68,7 @@ endif()
 if (KVM_EXPERIMENTAL)
 	target_compile_definitions(tinykvm PUBLIC TINYKVM_FAST_EXECUTION_TIMEOUT=1)
 endif()
+
 
 include(FetchContent)
 FetchContent_Declare(

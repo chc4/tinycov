@@ -2,6 +2,7 @@
 
 #include "../common.hpp"
 #include <array>
+#include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <linux/kvm.h>
@@ -73,16 +74,19 @@ void set_exception_handler_user(void* area, uint8_t vec, uint64_t handler)
 	idt.entry[vec].ist = 2;
 }
 
-/* unsigned interrupts[] = { ... } */
-#include "builtin/kernel_assembly.h"
-static_assert(sizeof(interrupts) > 10 && sizeof(interrupts) <= 4096,
-	"Interrupts array must be container within a 4KB page");
+extern "C" {
+    extern const uint8_t _binary_interrupts_bin_start[];
+    extern const uint8_t _binary_interrupts_bin_end[];
+}
+#define INTERRUPTS_SIZE (_binary_interrupts_bin_end - _binary_interrupts_bin_start)
+
 
 const iasm_header& interrupt_header() {
-	return *(const iasm_header*) &interrupts[0];
+	assert((size_t)&_binary_interrupts_bin_start[0] % 4 == 0);
+	return *(const iasm_header*) &_binary_interrupts_bin_start[0];
 }
 iasm_header& mutable_interrupt_header() {
-	return *(iasm_header*) &interrupts[0];
+	return *(iasm_header*) &_binary_interrupts_bin_start[0];
 }
 
 void setup_amd64_exception_regs(struct kvm_sregs& sregs, uint64_t addr)
@@ -93,7 +97,8 @@ void setup_amd64_exception_regs(struct kvm_sregs& sregs, uint64_t addr)
 
 void setup_amd64_exceptions(uint64_t addr, void* area, void* except_area)
 {
-	uint64_t offset = addr + interrupt_header().vm64_exception;
+	uint64_t offset = interrupt_header().vm64_exception;
+	printf("vm64_excepton offset %x\n", offset);
 	for (int i = 0; i <= 20; i++) {
 		if (i == 15) continue;
 		//printf("Exception handler %d at 0x%lX\n", i, offset);
@@ -106,9 +111,9 @@ void setup_amd64_exceptions(uint64_t addr, void* area, void* except_area)
 	// Install ring 3 -> ring 3 int3 handler.
 	// The 0x1000 is to use INST2 instead of INST so the code is user accessible..
 	//set_exception_handler_user(area, 3, addr + 0x1000 + (interrupt_header().vm64_exception * 3));
-	set_exception_handler_user(area, 3, addr + 0x1000 + interrupt_header().vm64_exception + (interrupt_header().vm64_except_size * 3));
+	set_exception_handler_user(area, 3, 0x1000 + interrupt_header().vm64_exception + (interrupt_header().vm64_except_size * 3));
 	// Install exception handling code
-	std::memcpy(except_area, interrupts, sizeof(interrupts));
+	std::memcpy(except_area, _binary_interrupts_bin_start, INTERRUPTS_SIZE);
 }
 
 TINYKVM_COLD()
