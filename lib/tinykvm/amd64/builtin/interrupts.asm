@@ -1,4 +1,6 @@
 [BITS 64]
+extern _guest_end
+extern _guest_interrupt_handler
 global vm64_exception
 ;; CPU exception frame:
 ;; 1. stack    rsp+32
@@ -28,8 +30,9 @@ ALIGN 0x8
 dw .vm64_syscall
 dw .vm64_gettimeofday
 dw .vm64_exception
-dw .vm64_exception
+dw .vm64_except1 - .vm64_exception
 dw .vm64_dso
+dw _guest_end
 .vm64_remote_return_addr:
 	dw 0x0   ;; Return address after remote call
 dd 0x0       ;; Reserved/Padding
@@ -260,7 +263,7 @@ ALIGN 0x10
 	;; completely in the guest, but for debugging emit a vmexit so we can tell
 	;; what's going on in the vmm.
 	mov rax, [rsp + 8]
-	out 254, eax
+	out 256 + 32, eax
 	mov [rsp + 8], rax
 	pop rax
 	iretq

@@ -31,7 +31,7 @@
 #define TRAMPOLINE_SIZE (0x1000 - 12) // Number of bytes in each trampoline page
 
 #define EMIT_COVERAGE 1
-//#define DEBUG 1
+#define DEBUG 1
 #ifdef DEBUG
 #define dprintf printf
 #else
@@ -556,7 +556,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         dprintf("trampoline h:%x g:%x contains\n", page.host_addr, page.guest_addr);
 
         host_code = (uint32_t*)(page.host_addr + inst_disp);
-        dprintf("inst=%x\n", *host_code);
+        dprintf("pc=%p inst=%x\n", pc, *host_code);
         uint32_t target = page.guest_addr + inst_disp;
 
 #ifdef EMIT_COVERAGE
