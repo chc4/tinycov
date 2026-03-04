@@ -1,6 +1,6 @@
 [BITS 64]
 extern _guest_end
-extern _guest_interrupt_handler
+extern _guest_bp_handler
 global vm64_exception
 ;; CPU exception frame:
 ;; 1. stack    rsp+32
@@ -258,14 +258,18 @@ ALIGN 0x10
 	o64 sysret
 
 .vm64_bp:
-	push rax
+	push rdi
 	;; long term we want the breakpoint interrupt to handle coverage items
 	;; completely in the guest, but for debugging emit a vmexit so we can tell
 	;; what's going on in the vmm.
-	mov rax, [rsp + 8]
+	lea rdi, [rsp]
+	call _guest_bp_handler
+	;; only take the vmexit if we need the vmm to instrument more blocks
+;;	test rdi, rdi
+;;	jz .vm64_bp_ret
 	out 256 + 32, eax
-	mov [rsp + 8], rax
-	pop rax
+.vm64_bp_ret:
+	pop rdi
 	iretq
 
 .vm64_page_fault:

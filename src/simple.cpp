@@ -19,6 +19,9 @@
 #include <roaring.hh>
 
 #include <tinykvm/rsp_client.hpp>
+#define HOST 1
+#include <tinykvm/amd64/builtin/guest.h>
+
 #define GUEST_MEMORY   0x80000000  /* 2GB memory */
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
 // Trampoline selector bits
@@ -29,9 +32,13 @@
 #define COVERAGE_DYNCALL (0xc0) // Mark dynamic dispatch call instructions
 #define COVERAGE_BITS (COVERAGE_FRESH | COVERAGE_DYNJUMP | COVERAGE_DYNCALL)
 #define TRAMPOLINE_SIZE (0x1000 - 12) // Number of bytes in each trampoline page
+#define COVERAGE_BITMAP_SIZE (0x1000) // Number of bytes in the coverage bitmap
 
+#define INSTRUMENT_DYNJUMP 1
+#define INSTRUMENT_DYNCALL 1
 #define EMIT_COVERAGE 1
 #define DEBUG 1
+
 #ifdef DEBUG
 #define dprintf printf
 #else
@@ -62,15 +69,42 @@ struct TrampolinePage {
 static std::vector<struct TrampolinePage> trampoline = {};
 static uint32_t next_index = 0;
 
+static struct CollectorState *collect_state;
+uint64_t collect_state_guest;
 
 void hexdump(tinykvm::vCPU& cpu, uintptr_t data, uintptr_t len) {
-    char* mem = cpu.machine().main_memory().at(0x21ef44, 16);
+    char* mem = cpu.machine().main_memory().at(data, len);
     dprintf("%x: ", data);
-    for(int i = 0; i < 16; i++) {
+    for(int i = 0; i < len; i++) {
         dprintf("%02x ", (unsigned char)mem[i]);
     }
     dprintf("\n");
 }
+
+struct TrampolinePage *allocate_trampoline(tinykvm::Machine& machine) {
+    uint64_t guest_addr = machine.mmap_allocate(0x1000, 0x7, false);
+    page_at(machine.main_memory(), guest_addr, [] (uint64_t addr, uint64_t& entry, size_t size) {
+        // Make the page executable by the user (There is probably a better way to do this?)
+        entry = entry & ~PDE64_NX;
+    });
+
+
+    uintptr_t host_addr = (uintptr_t)machine.main_memory().at(guest_addr, 0x1000);
+    memset((char*)host_addr, 0, 0x1000);
+    dprintf("allocated new trampoline page @ h:%x g:%x\n", host_addr, guest_addr);
+    struct TrampolinePage new_page = {
+        .host_addr = host_addr,
+        .guest_addr = guest_addr,
+        .present = {},
+        .index = next_index,
+    };
+    assert(next_index < 0x40);
+    next_index += 1;
+    trampoline.push_back(new_page);
+    collect_state->trampolines[new_page.index] = guest_addr;
+    return &trampoline.back();
+}
+
 
 struct TrampolinePage *find_trampoline(tinykvm::vCPU& cpu, uint16_t disp, uint16_t len) {
     struct TrampolinePage *page = nullptr;
@@ -90,26 +124,7 @@ struct TrampolinePage *find_trampoline(tinykvm::vCPU& cpu, uint16_t disp, uint16
     }
     if(!page) {
         // We fellthough without finding a free trampoline slot
-        uint64_t guest_addr = cpu.machine().mmap_allocate(0x1000, 0x7, false);
-        page_at(cpu.machine().main_memory(), guest_addr, [] (uint64_t addr, uint64_t& entry, size_t size) {
-            // Make the page executable by the user (There is probably a better way to do this?)
-            entry = entry & ~PDE64_NX;
-        });
-
-
-        uintptr_t host_addr = (uintptr_t)cpu.machine().main_memory().at(guest_addr, 0x1000);
-        memset((char*)host_addr, 0, 0x1000);
-        dprintf("allocated new trampoline page @ h:%x g:%x\n", host_addr, guest_addr);
-        struct TrampolinePage new_page = {
-            .host_addr = host_addr,
-            .guest_addr = guest_addr,
-            .present = {},
-            .index = next_index,
-        };
-        assert(next_index < 0x40);
-        next_index += 1;
-        trampoline.push_back(new_page);
-        page = &trampoline.back();
+        page = allocate_trampoline(cpu.machine());
     }
     return page;
 }
@@ -191,6 +206,9 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
 }
 
 static void hook_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
+    if(!INSTRUMENT_DYNCALL) {
+        return;
+    }
     // Install a coverage hook on a dynamic dispatch call exit of a basic block
     // Unlike branch tracing we can't use trampoline code, because then the
     // guest will observe the return address being the trampoline code instead
@@ -476,19 +494,18 @@ int resolve_target(tinykvm::vMemory& memory, cs_insn *insn, tinykvm::tinykvm_x86
 }
 
 static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, uint8_t *selector) {
-    auto guest_rsp = cpu.registers().rsp;
-    auto host_stack = (uint64_t*)cpu.machine().main_memory().at(guest_rsp, 0x30);
+    auto guest_frame = cpu.registers().rdi;
+    auto host_frame = (struct stack_frame*)cpu.machine().main_memory().at(guest_frame, sizeof(struct stack_frame));
     // guest_rsp is the guest *kernel* stack. we need to get the guest user rsp
     // from the pushed exception.
-    auto guest_user_rax = host_stack[0];
-    auto guest_user_rsp = host_stack[4];
+    auto guest_user_rsp = host_frame->stack;
     dprintf("guest_user_rsp %p\n", guest_user_rsp);
     hexdump(cpu, guest_user_rsp, 0x20);
     // Push to the user stack
     guest_user_rsp = guest_user_rsp - sizeof(uintptr_t);
     auto host_ret = (uint64_t*)cpu.machine().main_memory().at(guest_user_rsp, sizeof(uintptr_t));
     *host_ret = pc+2;
-    host_stack[4] = guest_user_rsp;
+    host_frame->stack = guest_user_rsp;
 
     // ugh this doesn't even work well, because we can't resolve the call target to
     // follow and push the coverage frontier forward, or record in our coverage map...
@@ -503,7 +520,7 @@ static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, ui
     assert(cs_disasm(handle, code, 0x20, pc, 1, &insn) == 1);
 
     auto regs = cpu.registers();
-    regs.rax = guest_user_rax;
+    regs.rdi = host_frame->rdi;
     regs.rsp = guest_user_rsp;
     regs.rip = pc;
     uint64_t target = 0;
@@ -525,19 +542,31 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     //*((uint8_t*)entry_mem + 1) = 0x90;
     //*((uint8_t*)entry_mem + 2) = 0x90;
     dprintf("bytes at start: %s\n", entry_mem);
-    hook_block(machine.cpu(), start_address);
 
     print_gdt_entries(machine.main_memory().at(machine.get_special_registers().gdt.base), 7);
     machine.print_exception_handlers();
 
+
+    collect_state_guest = machine.mmap_allocate(0x1000, 0x7, false);
+    collect_state = (struct CollectorState *)machine.main_memory().at(collect_state_guest,
+        sizeof(*collect_state));
+    printf("collector state @ %p\n", collect_state);
+
+    // Create coverage bitmap
+    collect_state->coverage_map = machine.mmap_allocate(COVERAGE_BITMAP_SIZE, 0x7, false);
+    printf("coverage map @ %x\n", collect_state->coverage_map);
+
+
     machine.install_output_handler([](tinykvm::vCPU& cpu, unsigned int io_port, unsigned int val) {
         if(io_port != 0x20) { return; }
-        dprintf("custom io handler, val=%llx\n", val);
-        uint32_t pc = val - 1; // INT3 advances by one byte
+        auto guest_frame = cpu.registers().rdi;
+        printf("huh?? %x\n", guest_frame);
+        auto host_frame = (struct stack_frame*)cpu.machine().main_memory().at(guest_frame, sizeof(struct stack_frame));
+        printf("rdi=%x rip=%x cs=%x rflags=%x stack=%x\n", host_frame->rdi, host_frame->rip, host_frame->cs, host_frame->rflags, host_frame->stack);
+        uint64_t rflags = host_frame->rflags;
+        size_t pc = host_frame->rip - 1;
         auto host_code = (uint32_t*)cpu.machine().main_memory().at(pc, 0x10);
-        auto guest_rsp = cpu.registers().rsp;
-        auto host_stack = (uint64_t*)cpu.machine().main_memory().at(guest_rsp, 0x30);
-        uint64_t rflags = host_stack[3];
+        dprintf("custom io handler, val=%llx\n", host_frame->rip);
 
         // Load trampoline page index
         uint8_t *index = (uint8_t*)(((char*)host_code) + 1);
@@ -566,18 +595,37 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         if((*index & COVERAGE_BITS) == COVERAGE_DYNCALL) {
             target = hit_dyncall(cpu, pc, (uint8_t*)host_code, index);
         } else if((*index & COVERAGE_BITS) == COVERAGE_DYNJUMP) {
+            // TODO: INSTRUMENT_DYNJUMP
             assert(false);
         }
 
-        cpu.registers().rax = target;
-        cpu.set_registers(cpu.registers());
+        host_frame->rip = target;
 
         return;
     });
 
+    // For debugging we occasionally want to pre-allocate all of the trampoline
+    // pages, since otherwise dynamically mapped in user code will be at different
+    // addresses and thus set different coverage bits.
+    for(int i = 0; i < 0x3f; i++) {
+        allocate_trampoline(machine);
+    }
+
+    hook_block(machine.cpu(), start_address);
+
     return 0;
 }
 
+void coverage_report(tinykvm::Machine& machine) {
+    //uint8_t coverage_map = cpu.machine().main_memory().at(coverage_map, 0x1000);
+    hexdump(machine.cpu(), collect_state->coverage_map, 0x1000);
+    uint8_t* mem = (uint8_t *)machine.main_memory().at(collect_state->coverage_map, COVERAGE_BITMAP_SIZE);
+    uint32_t count = 0;
+    for(int i = 0; i < COVERAGE_BITMAP_SIZE; i++) {
+        count += std::popcount(mem[i]);
+    }
+    printf("Count: 0x%x\n", count);
+}
 
 
 int main(int argc, char** argv)
@@ -679,7 +727,7 @@ int main(int argc, char** argv)
 
     master_vm.setup_linux(
         args,
-        {"LC_TYPE=C", "LC_ALL=C", "USER=root", "LD_BIND_NOW=1"});
+        {"LC_TYPE=C", "LC_ALL=C", "USER=root", "LD_BIND_NOW=1", "LD_DEBUG=all"});
 
     if(getenv("COVERAGE")) {
         install_coverage_hooks(master_vm);
@@ -752,6 +800,7 @@ int main(int argc, char** argv)
     if (call_addr == 0x0) {
         double t = nanodiff(t0, t1) / 1e9;
         printf("Time: %fs Return value: %ld\n", t, master_vm.return_value());
+        coverage_report(master_vm);
         return 0;
     }
 

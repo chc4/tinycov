@@ -15,7 +15,7 @@ add_custom_command(
 
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/guest.o
-    COMMAND ${CMAKE_CXX_COMPILER} -c -mno-mmx -mno-sse -mno-sse2 -mno-sse3 -mno-3dnow -mno-red-zone -mno-80387 -fno-pie -fno-stack-protector -ffreestanding
+    COMMAND ${CMAKE_CXX_COMPILER} -c -mno-mmx -mno-sse -mno-sse2 -mno-sse3 -mno-3dnow -mno-red-zone -mno-80387 -fno-pie -fno-stack-protector -ffreestanding -masm=intel
             -o ${CMAKE_CURRENT_BINARY_DIR}/guest.o
             ${CMAKE_CURRENT_SOURCE_DIR}/guest.cpp
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/guest.cpp
