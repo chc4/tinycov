@@ -131,7 +131,19 @@ struct TrampolinePage *find_trampoline(tinykvm::vCPU& cpu, uint16_t disp, uint16
 
 static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     // Install coverage hook on a branch exit of a basic block
-    uint8_t trampoline_code[12] = {};
+    struct __attribute__((packed)) trampoline_bytes {
+        uint8_t jcc;
+        uint8_t disp;
+
+        uint8_t jcc_fallthrough;
+        uint32_t disp_fallthrough;
+
+        uint8_t jcc_taken;
+        uint32_t disp_taken;
+    };
+    static_assert(sizeof(struct trampoline_bytes) == 12);
+
+    struct trampoline_bytes trampoline_code = {};
     dprintf("hooking @ %x\n", pc);
     uint16_t inst_disp = pc % TRAMPOLINE_SIZE;
     size_t start_page = (pc / TRAMPOLINE_SIZE);
@@ -171,18 +183,18 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
 
     // We have page and it doesn't have any overlapping data
     // Write trampoline: jcc +5; jmp fallthrough; jmp target
-    trampoline_code[0] = 0x70 | condition_code;  // jcc +5
-    trampoline_code[1] = 0x05;                   // offset +5
+    trampoline_code.jcc = 0x70 | condition_code;  // jcc +5
+    trampoline_code.disp = 0x05;                   // offset +5
     // jmp fallthrough (5 bytes)
     uint64_t target_fallthrough = pc + inst->size;
     int64_t fallthrough_offset = target_fallthrough - (page->guest_addr + inst_disp + 7);
-    trampoline_code[2] = 0xE9;  // jmp rel32
-    *(int32_t*)(&trampoline_code[3]) = (int32_t)fallthrough_offset;
+    trampoline_code.jcc_fallthrough = 0xE9;  // jmp rel32
+    trampoline_code.disp_fallthrough = (int32_t)fallthrough_offset;
     // jmp target (5 bytes)
     uint64_t target_taken = inst->detail->x86.operands[0].imm;
     int64_t taken_offset = target_taken - (page->guest_addr + inst_disp + 12);
-    trampoline_code[7] = 0xE9;  // jmp rel32
-    *(int32_t*)(&trampoline_code[8]) = (int32_t)taken_offset;
+    trampoline_code.jcc_taken = 0xE9;  // jmp rel32
+    trampoline_code.disp_taken = (int32_t)taken_offset;
 
     dprintf("hook coverage @ %p -> %p, %p\n", pc, target_fallthrough, target_taken);
 
@@ -192,7 +204,7 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
         // Mark the bytes we will use as present
         page->present.add(inst_disp + i);
         // Write the trampoline
-        *((char*)page->host_addr + inst_disp + i) = trampoline_code[i];
+        *((char*)page->host_addr + inst_disp + i) = ((char*)&trampoline_code)[i];
     }
     for(i = 0; i < inst->size; i++) {
         // NOP out the actual branch
@@ -279,13 +291,6 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
         return;
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
 
-    if(!seen.contains(entry)) {
-        seen.add(entry);
-        blocks.push_back(entry);
-    } else {
-        return;
-    }
-
     auto add_exit = [](uint32_t dest) {
         if(dest == 0) { return false; }
 
@@ -294,6 +299,13 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
         blocks.push_back(dest);
         return true;
     };
+
+    if(!seen.contains(entry)) {
+        seen.add(entry);
+        blocks.push_back(entry);
+    } else {
+        goto cleanup;
+    }
 
     while(blocks.size() > 0) {
         uintptr_t entry = blocks.at(blocks.size() - 1);
@@ -385,6 +397,7 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
         }
     }
 
+cleanup:
     cs_close(&handle);
 }
 
@@ -401,7 +414,9 @@ static void hit_fresh_branch(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *selector
     uint8_t (*trampoline_code)[12] = (uint8_t(*)[12])(page.host_addr + inst_disp);
 
     int32_t fallthrough_offset = *(int32_t*)&(*trampoline_code)[3];
-    int32_t taken_offset = *(int32_t*)&(*trampoline_code)[8];
+    int32_t taken_offset = 0;
+    memcpy(&taken_offset, &(*trampoline_code)[8], sizeof(taken_offset));
+
     uint32_t target_fallthrough = page.guest_addr + inst_disp + 7 + fallthrough_offset;
     uint32_t target_taken = page.guest_addr + inst_disp + 12 + taken_offset;
     dprintf("fresh coverage @ %p -> %p, %p\n", pc, target_fallthrough, target_taken);
@@ -530,6 +545,7 @@ static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, ui
 #ifdef EMIT_COVERAGE
     printf("dyncall %p -> %p\n", pc, target);
 #endif
+    cs_close(&handle);
     hook_block(cpu, target);
     return target;
 }
@@ -565,11 +581,11 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         printf("rdi=%x rip=%x cs=%x rflags=%x stack=%x\n", host_frame->rdi, host_frame->rip, host_frame->cs, host_frame->rflags, host_frame->stack);
         uint64_t rflags = host_frame->rflags;
         size_t pc = host_frame->rip - 1;
-        auto host_code = (uint32_t*)cpu.machine().main_memory().at(pc, 0x10);
+        auto host_code = (char*)cpu.machine().main_memory().at(pc, 0x10);
         dprintf("custom io handler, val=%llx\n", host_frame->rip);
 
         // Load trampoline page index
-        uint8_t *index = (uint8_t*)(((char*)host_code) + 1);
+        uint8_t *index = (uint8_t*)(host_code + 1);
         // Check if this is the first time a coverage hook was hit, in which case
         // we need to push the coverage frontier forward
         if((*index & COVERAGE_BITS) == COVERAGE_FRESH) {
@@ -584,8 +600,10 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
 
         dprintf("trampoline h:%x g:%x contains\n", page.host_addr, page.guest_addr);
 
-        host_code = (uint32_t*)(page.host_addr + inst_disp);
-        dprintf("pc=%p inst=%x\n", pc, *host_code);
+        uint8_t *trampoline_code = (uint8_t*)(page.host_addr + inst_disp);
+        uint32_t trampoline_code_bytes = 0;
+        memcpy(&trampoline_code_bytes, trampoline_code, sizeof(trampoline_code_bytes));
+        dprintf("pc=%p inst=%x\n", pc, trampoline_code_bytes);
         uint32_t target = page.guest_addr + inst_disp;
 
 #ifdef EMIT_COVERAGE
@@ -593,7 +611,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
 #endif
 
         if((*index & COVERAGE_BITS) == COVERAGE_DYNCALL) {
-            target = hit_dyncall(cpu, pc, (uint8_t*)host_code, index);
+            target = hit_dyncall(cpu, pc, trampoline_code, index);
         } else if((*index & COVERAGE_BITS) == COVERAGE_DYNJUMP) {
             // TODO: INSTRUMENT_DYNJUMP
             assert(false);
@@ -607,9 +625,9 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     // For debugging we occasionally want to pre-allocate all of the trampoline
     // pages, since otherwise dynamically mapped in user code will be at different
     // addresses and thus set different coverage bits.
-    for(int i = 0; i < 0x3f; i++) {
-        allocate_trampoline(machine);
-    }
+    //for(int i = 0; i < 0x3f; i++) {
+    //    allocate_trampoline(machine);
+    //}
 
     hook_block(machine.cpu(), start_address);
 

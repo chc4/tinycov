@@ -21,5 +21,8 @@ extern "C" [[gnu::no_caller_saved_registers]] void _guest_bp_handler(struct stac
     uint32_t idx = mixed & (BITMAP_SIZE-1);
     bitmap[idx >> CHAR_BIT] |= 1<<(idx & (CHAR_BIT-1));
     (void)frame->stack;
+
+    //frame->rdi = 0xbadc0de;
+    //asm("mov rdi, %0;\n out 32, eax" :: "r"(frame) : "rdi", "rax");
     return;
 }
