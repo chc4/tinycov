@@ -265,8 +265,8 @@ ALIGN 0x10
 	lea rdi, [rsp]
 	call _guest_bp_handler
 	;; only take the vmexit if we need the vmm to instrument more blocks
-;;	test rdi, rdi
-;;	jz .vm64_bp_ret
+	test rdi, rdi
+	jz .vm64_bp_ret
 	out 256 + 32, eax
 .vm64_bp_ret:
 	pop rdi

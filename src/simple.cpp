@@ -24,18 +24,8 @@
 
 #define GUEST_MEMORY   0x80000000  /* 2GB memory */
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
-// Trampoline selector bits
-// We will never have a FRESH DYNJUMP, because dynamic dispatch hooks must always
-// be considered fresh: we always need to try and follow the targets at runtime.
-#define COVERAGE_FRESH (0x80) // Mark unhit branch hooks
-#define COVERAGE_DYNJUMP (0x40) // Mark dynamic dispatch jump instructions
-#define COVERAGE_DYNCALL (0xc0) // Mark dynamic dispatch call instructions
-#define COVERAGE_BITS (COVERAGE_FRESH | COVERAGE_DYNJUMP | COVERAGE_DYNCALL)
-#define TRAMPOLINE_SIZE (0x1000 - 12) // Number of bytes in each trampoline page
-#define COVERAGE_BITMAP_SIZE (0x1000) // Number of bytes in the coverage bitmap
-
-#define INSTRUMENT_DYNJUMP 1
-#define INSTRUMENT_DYNCALL 1
+#define INSTRUMENT_DYNJUMP 0
+#define INSTRUMENT_DYNCALL 0
 #define EMIT_COVERAGE 1
 #define DEBUG 1
 
@@ -550,6 +540,7 @@ static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, ui
     return target;
 }
 
+static uint64_t coverage_vmexit_count = 0;
 static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     uint64_t start_address = machine.registers().rip;
     dprintf("elf start @ %p\n", start_address);
@@ -566,7 +557,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     collect_state_guest = machine.mmap_allocate(0x1000, 0x7, false);
     collect_state = (struct CollectorState *)machine.main_memory().at(collect_state_guest,
         sizeof(*collect_state));
-    printf("collector state @ %p\n", collect_state);
+    printf("collector state @ g=%p s=%p\n", collect_state_guest, collect_state);
 
     // Create coverage bitmap
     collect_state->coverage_map = machine.mmap_allocate(COVERAGE_BITMAP_SIZE, 0x7, false);
@@ -575,6 +566,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
 
     machine.install_output_handler([](tinykvm::vCPU& cpu, unsigned int io_port, unsigned int val) {
         if(io_port != 0x20) { return; }
+        coverage_vmexit_count += 1;
         auto guest_frame = cpu.registers().rdi;
         printf("huh?? %x\n", guest_frame);
         auto host_frame = (struct stack_frame*)cpu.machine().main_memory().at(guest_frame, sizeof(struct stack_frame));
@@ -642,7 +634,8 @@ void coverage_report(tinykvm::Machine& machine) {
     for(int i = 0; i < COVERAGE_BITMAP_SIZE; i++) {
         count += std::popcount(mem[i]);
     }
-    printf("Count: 0x%x\n", count);
+    printf("Coverage Count: 0x%x\n", count);
+    printf("VMExit Count: 0x%x\n", coverage_vmexit_count);
 }
 
 
