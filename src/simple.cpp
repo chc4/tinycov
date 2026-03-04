@@ -28,7 +28,7 @@
 #define INSTRUMENT_DYNJUMP 0
 #define INSTRUMENT_DYNCALL 0
 #define EMIT_COVERAGE 1
-#define DEBUG 1
+#define DEBUG 0
 
 #ifdef DEBUG
 #define dprintf printf
@@ -559,11 +559,11 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     collect_state_guest = machine.mmap_allocate(0x1000, 0x7, false);
     collect_state = (struct CollectorState *)machine.main_memory().at(collect_state_guest,
         sizeof(*collect_state));
-    printf("collector state @ g=%p s=%p\n", collect_state_guest, collect_state);
+    dprintf("collector state @ g=%p s=%p\n", collect_state_guest, collect_state);
 
     // Create coverage bitmap
     collect_state->coverage_map = machine.mmap_allocate(COVERAGE_BITMAP_SIZE, 0x7, false);
-    printf("coverage map @ %x\n", collect_state->coverage_map);
+    dprintf("coverage map @ %x\n", collect_state->coverage_map);
 
     ((tinykvm::iasm_header*)machine.main_memory().at(
         machine.main_memory().physbase + tinykvm::INTR_ASM_ADDR))->vm64_coverage_state = collect_state_guest;
@@ -573,9 +573,8 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         if(io_port != 0x20) { return; }
         coverage_vmexit_count += 1;
         auto guest_frame = cpu.registers().rdi;
-        printf("huh?? %x\n", guest_frame);
         auto host_frame = (struct stack_frame*)cpu.machine().main_memory().at(guest_frame, sizeof(struct stack_frame));
-        printf("rdi=%x rip=%x cs=%x rflags=%x stack=%x\n", host_frame->rdi, host_frame->rip, host_frame->cs, host_frame->rflags, host_frame->stack);
+        dprintf("rdi=%x rip=%x cs=%x rflags=%x stack=%x\n", host_frame->rdi, host_frame->rip, host_frame->cs, host_frame->rflags, host_frame->stack);
         uint64_t rflags = host_frame->rflags;
         size_t pc = host_frame->rip - 1;
         auto host_code = (char*)cpu.machine().main_memory().at(pc, 0x10);
@@ -743,7 +742,7 @@ int main(int argc, char** argv)
 
     master_vm.setup_linux(
         args,
-        {"LC_TYPE=C", "LC_ALL=C", "USER=root", "LD_BIND_NOW=1", "LD_DEBUG=all"});
+        {"LC_TYPE=C", "LC_ALL=C", "USER=root", "LD_BIND_NOW=1"});
 
     if(getenv("COVERAGE")) {
         install_coverage_hooks(master_vm);
@@ -816,7 +815,9 @@ int main(int argc, char** argv)
     if (call_addr == 0x0) {
         double t = nanodiff(t0, t1) / 1e9;
         printf("Time: %fs Return value: %ld\n", t, master_vm.return_value());
-        coverage_report(master_vm);
+        if(getenv("COVERAGE")) {
+            coverage_report(master_vm);
+        }
         return 0;
     }
 
