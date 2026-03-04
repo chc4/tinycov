@@ -35,6 +35,8 @@ dw .vm64_dso
 
 .vm64_remote_return_addr:
 	dw 0x0   ;; Return address after remote call
+.vm64_coverage_state_data:
+	dd 0x0
 dd 0x0       ;; Reserved/Padding
 
 ALIGN 0x10
@@ -267,7 +269,7 @@ ALIGN 0x10
 	;; only take the vmexit if we need the vmm to instrument more blocks
 	test rdi, rdi
 	jz .vm64_bp_ret
-	out 256 + 32, eax
+	out 32, eax
 .vm64_bp_ret:
 	pop rdi
 	iretq
@@ -340,3 +342,6 @@ ALIGN 0x8
 	CPU_EXCEPT 20
 	ALIGN 0x8 ;; timer interrupt
 		jmp .vm64_timeout
+
+global vm64_coverage_state
+vm64_coverage_state equ .vm64_coverage_state_data

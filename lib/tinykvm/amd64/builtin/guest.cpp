@@ -4,7 +4,9 @@
 
 #include "guest.h"
 
-struct CollectorState *state = (struct CollectorState*)0x20a00000;
+#define OPTIMIZE_VMEXIT 1
+
+extern struct CollectorState *vm64_coverage_state;
 // Compilers will attempt to align branches on i-cache boundaries to avoid Intel
 // errata and to optimize some uop cache cases. We use a single fast-hash round
 // as a mix function to try and spread the coverage item back out to the low bits.
@@ -15,14 +17,21 @@ uint64_t fast_hash(uint64_t h) {
     return h;
 }
 
+void crash_helper(struct stack_frame *frame, uint64_t tombstone) {
+    frame->rdi = tombstone;
+    frame->rip = 0xbadc0de;
+    return;
+}
+
 uint64_t register output asm("rdi");
 extern "C" [[gnu::no_caller_saved_registers]] void _guest_bp_handler(struct stack_frame *frame) {
     size_t pc = frame->rip - 1;
 
     // Record coverage
-    uint32_t mixed = fast_hash(pc);
+    uint32_t mixed = fast_hash(pc) ^ (fast_hash(vm64_coverage_state->previous) << 1);
+    vm64_coverage_state->previous = pc;
     uint32_t idx = mixed & (BITMAP_SIZE-1);
-    state->coverage_map[idx >> CHAR_BIT] |= 1<<(idx & (CHAR_BIT-1));
+    vm64_coverage_state->coverage_map[idx >> CHAR_BIT] |= 1<<(idx & (CHAR_BIT-1));
 
     uint8_t *index = (uint8_t*)(pc + 1);
     if((*index & COVERAGE_BITS) == COVERAGE_FRESH) {
@@ -33,14 +42,22 @@ extern "C" [[gnu::no_caller_saved_registers]] void _guest_bp_handler(struct stac
 
     uint8_t page_index = *index & ~COVERAGE_BITS;
     uintptr_t inst_disp = pc % TRAMPOLINE_SIZE;
-    auto page = state->trampolines[page_index];
+    auto page = vm64_coverage_state->trampolines[page_index];
     if(page == 0) {
         // VMM has to allocate trampoline page
-        frame->rdi = 0xf0f0f022;
         return;
     }
     size_t trampoline_code = (size_t)(page + inst_disp);
-    frame->rip = trampoline_code;
-    output = 0;
+    size_t target = trampoline_code;
+
+    if((*index & COVERAGE_BITS) == COVERAGE_DYNCALL) {
+        // Have to emulate DYNCALL in the VMM
+        return;
+    }
+
+    if(OPTIMIZE_VMEXIT) {
+        frame->rip = trampoline_code;
+        output = 0;
+    }
     return;
 }

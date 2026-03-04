@@ -4,6 +4,7 @@
 #include <tinykvm/memory.hpp>
 #include <tinykvm/amd64/paging.hpp>
 #include <tinykvm/amd64/amd64.hpp>
+#include <tinykvm/amd64/idt.hpp>
 #include <linux/kvm.h>
 #include <tinykvm/amd64/gdt.hpp>
 #include <algorithm>
@@ -472,6 +473,7 @@ typedef int (*read_memory_fn)(uint64_t address, void *buffer, size_t size, void 
 
 int resolve_target(tinykvm::vMemory& memory, cs_insn *insn, tinykvm::tinykvm_x86regs *regs, uint64_t *target) {
     cs_x86_op *op = &insn->detail->x86.operands[0];
+    printf("resolving dynamic target %s\n", insn->op_str);
 
     switch (op->type) {
         case X86_OP_REG:
@@ -562,6 +564,9 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     // Create coverage bitmap
     collect_state->coverage_map = machine.mmap_allocate(COVERAGE_BITMAP_SIZE, 0x7, false);
     printf("coverage map @ %x\n", collect_state->coverage_map);
+
+    ((tinykvm::iasm_header*)machine.main_memory().at(
+        machine.main_memory().physbase + tinykvm::INTR_ASM_ADDR))->vm64_coverage_state = collect_state_guest;
 
 
     machine.install_output_handler([](tinykvm::vCPU& cpu, unsigned int io_port, unsigned int val) {

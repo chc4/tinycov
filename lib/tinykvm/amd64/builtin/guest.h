@@ -22,6 +22,7 @@ struct CollectorState {
     // size of ~COVERAGE_BITS.
     guest(char*) trampolines[0x3f];
     guest(uint8_t*) coverage_map;
+    uint64_t previous;
 };
 static_assert(sizeof(struct CollectorState) < 0x1000);
 

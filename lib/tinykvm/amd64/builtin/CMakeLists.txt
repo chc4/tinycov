@@ -25,6 +25,7 @@ add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/interrupts.bin
     COMMAND ld -T ${CMAKE_CURRENT_SOURCE_DIR}/guest.ld
             --oformat binary
+            --allow-multiple-definition
             -o ${CMAKE_CURRENT_BINARY_DIR}/interrupts.bin
             ${CMAKE_CURRENT_BINARY_DIR}/interrupts_asm.o
             ${CMAKE_CURRENT_BINARY_DIR}/guest.o

@@ -200,6 +200,7 @@ uint64_t setup_amd64_paging(vMemory& memory,
 	const uint64_t except_page = INTR_ASM_ADDR >> 12;
 	lowpage[except_page] = PDE64_PRESENT | PDE64_G | (memory.physbase + INTR_ASM_ADDR);
 	/* User mapping of kernel code, for int3 */
+	// XXX: THIS SHOULDNT BE WRITABLE FIGURE OUT A BETTER WAY INSTEAD
 	lowpage[except_page+1] = PDE64_PRESENT | PDE64_G | PDE64_USER | (memory.physbase + INTR_ASM_ADDR);
 
 	/* Exception (IST) stack */
