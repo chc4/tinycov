@@ -11,6 +11,7 @@ add_custom_command(
             -o ${CMAKE_CURRENT_BINARY_DIR}/interrupts_asm.o
             ${CMAKE_CURRENT_SOURCE_DIR}/interrupts.asm
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/interrupts.asm
+            ${CMAKE_CURRENT_SOURCE_DIR}/guest.h
 )
 
 add_custom_command(

@@ -20,6 +20,7 @@ uint64_t fast_hash(uint64_t h) {
 void crash_helper(struct stack_frame *frame, uint64_t tombstone) {
     frame->rdi = tombstone;
     frame->rip = 0xbadc0de;
+
     return;
 }
 
@@ -30,7 +31,7 @@ extern "C" [[gnu::no_caller_saved_registers]] void _guest_bp_handler(struct stac
     // Record coverage
     uint32_t mixed = fast_hash(pc) ^ (fast_hash(vm64_coverage_state->previous) << 1);
     vm64_coverage_state->previous = pc;
-    uint32_t idx = mixed & (BITMAP_SIZE-1);
+    uint32_t idx = mixed & ((COVERAGE_BITMAP_SIZE << CHAR_BIT)-1);
     vm64_coverage_state->coverage_map[idx >> CHAR_BIT] |= 1<<(idx & (CHAR_BIT-1));
 
     uint8_t *index = (uint8_t*)(pc + 1);
@@ -52,6 +53,8 @@ extern "C" [[gnu::no_caller_saved_registers]] void _guest_bp_handler(struct stac
 
     if((*index & COVERAGE_BITS) == COVERAGE_DYNCALL) {
         // Have to emulate DYNCALL in the VMM
+        // TODO: we can instead JIT the DYNCALL emulation to the trampoline so we
+        // don't need to take a VMExit
         return;
     }
 

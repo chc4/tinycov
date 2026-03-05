@@ -26,9 +26,9 @@
 #define GUEST_MEMORY   0x80000000  /* 2GB memory */
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
 #define INSTRUMENT_DYNJUMP 0
-#define INSTRUMENT_DYNCALL 0
+#define INSTRUMENT_DYNCALL 1
 #define EMIT_COVERAGE 1
-#define DEBUG 0
+//#define DEBUG 0
 
 #ifdef DEBUG
 #define dprintf printf
@@ -63,7 +63,7 @@ static uint32_t next_index = 0;
 static struct CollectorState *collect_state;
 uint64_t collect_state_guest;
 
-void hexdump(tinykvm::vCPU& cpu, uintptr_t data, uintptr_t len) {
+void dhexdump(tinykvm::vCPU& cpu, uintptr_t data, uintptr_t len) {
     char* mem = cpu.machine().main_memory().at(data, len);
     dprintf("%x: ", data);
     for(int i = 0; i < len; i++) {
@@ -71,6 +71,16 @@ void hexdump(tinykvm::vCPU& cpu, uintptr_t data, uintptr_t len) {
     }
     dprintf("\n");
 }
+
+void hexdump(tinykvm::vCPU& cpu, uintptr_t data, uintptr_t len) {
+    char* mem = cpu.machine().main_memory().at(data, len);
+    printf("%x: ", data);
+    for(int i = 0; i < len; i++) {
+        printf("%02x ", (unsigned char)mem[i]);
+    }
+    printf("\n");
+}
+
 
 struct TrampolinePage *allocate_trampoline(tinykvm::Machine& machine) {
     uint64_t guest_addr = machine.mmap_allocate(0x1000, 0x7, false);
@@ -473,7 +483,7 @@ typedef int (*read_memory_fn)(uint64_t address, void *buffer, size_t size, void 
 
 int resolve_target(tinykvm::vMemory& memory, cs_insn *insn, tinykvm::tinykvm_x86regs *regs, uint64_t *target) {
     cs_x86_op *op = &insn->detail->x86.operands[0];
-    printf("resolving dynamic target %s\n", insn->op_str);
+    dprintf("resolving dynamic target %s\n", insn->op_str);
 
     switch (op->type) {
         case X86_OP_REG:
@@ -507,7 +517,7 @@ static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, ui
     // from the pushed exception.
     auto guest_user_rsp = host_frame->stack;
     dprintf("guest_user_rsp %p\n", guest_user_rsp);
-    hexdump(cpu, guest_user_rsp, 0x20);
+    dhexdump(cpu, guest_user_rsp, 0x20);
     // Push to the user stack
     guest_user_rsp = guest_user_rsp - sizeof(uintptr_t);
     auto host_ret = (uint64_t*)cpu.machine().main_memory().at(guest_user_rsp, sizeof(uintptr_t));
@@ -631,8 +641,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
 }
 
 void coverage_report(tinykvm::Machine& machine) {
-    //uint8_t coverage_map = cpu.machine().main_memory().at(coverage_map, 0x1000);
-    hexdump(machine.cpu(), collect_state->coverage_map, 0x1000);
+    hexdump(machine.cpu(), collect_state->coverage_map, COVERAGE_BITMAP_SIZE);
     uint8_t* mem = (uint8_t *)machine.main_memory().at(collect_state->coverage_map, COVERAGE_BITMAP_SIZE);
     uint32_t count = 0;
     for(int i = 0; i < COVERAGE_BITMAP_SIZE; i++) {

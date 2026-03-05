@@ -9,8 +9,6 @@ This uses *software breakpoints* in the guest userspace to implement coverage ho
 
 The VMM traces basic blocks for exits, and when it finds one JITs an assembly snippet on a *trampoline page*. The exit is replaced with `INT3 <index>` where `<index>` encodes some metadata bits (such as if the branch hasn't been hit yet), along with selects a trampoline page. When the branch is hit the guest kernel uses the `<index>` byte to redirect the guest userspace to the assembly snippet on the correct trampoline page, and if it was the first time the branch was hit traces the basic blocks which are the successors of the exit to find more exits.
 
-Currently this all happens in the host VMM for prototyping, but ideally most of it would happen in the guest kernel instead.
-
 We currently don't support dynamic jumps, only conditionals and dynamic calls; this means binaries will have some missing coverage.
 
 # Why
@@ -31,3 +29,24 @@ make -j && ALL_PATHS=1 COVERAGE=1 /build/simplekvm <some binary> <some arguments
 And then remove `COVERAGE=1` to see how much faster it is without the instrumentation.
 
 Run it on statically linked executables, or else you probably are missing most of the program due to TinyCOV missing the dynamic linker jumping to `_start`.
+
+
+# TODO
+
+In no particular order,
+
+- [ ] DYNJUMP instrumentation
+    - [ ] JIT
+- [ ] JIT DYNCALL instrumentation instead of using Capstone in the steadystate
+    - [ ] Setup FS/GS so the JIT code can write to the coverage map
+- [ ] Coverage trace export
+    - [ ] Symbolizing coverage items
+    - [ ] DragonDance coverage export
+- [ ] Forkserv based fuzzing harness
+    - [ ] Re-integrate child coverage hooks back into the fork parent
+    - [ ] Child resetting based on hardware PTE dirty bits
+    - [ ] Eager CoW breaking for hot pages
+- [ ] Cmpcov mode for magic byte collection in the trampoline code
+- [ ] LibAFL fuzzing provider
+- [ ] Saturated edge unhooking
+    - If we see both exits from a block, we can uninstall the coverage hook from it since it can't contribute new edges to later runs

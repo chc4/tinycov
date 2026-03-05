@@ -33,4 +33,3 @@ struct stack_frame {
     size_t rflags;
     size_t stack;
 };
-#define BITMAP_SIZE (0x1000 << CHAR_BIT)
