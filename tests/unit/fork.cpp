@@ -4,7 +4,7 @@
 #include <tinykvm/machine.hpp>
 extern std::vector<uint8_t> build_and_load(const std::string& code);
 static const uint64_t MAX_MEMORY = 8ul << 20; /* 8MB */
-static const uint64_t MAX_COWMEM = 3ul << 20; /* 1MB */
+static const uint64_t MAX_COWMEM = 3ul << 20; /* 3MB */
 static const std::vector<std::string> env {
 	"LC_TYPE=C", "LC_ALL=C", "USER=root"
 };
@@ -564,5 +564,111 @@ int func2() {
 
 		fork2.vmcall("func1");
 		REQUIRE(fork2.return_value() == 22222);
+	}
+}
+
+TEST_CASE("Fork before main()", "[Fork]")
+{
+	const auto binary = build_and_load(R"M(
+#include <stdio.h>
+extern void _exit(int);
+int main() {
+	printf("Hello World!\n");
+	_exit(666);
+	return 666;
+}
+static unsigned value = 12345;
+void set_value(int v) {
+	value = v;
+}
+int func1() {
+	return value;
+}
+int func2() {
+	return 54321;
+}
+)M");
+
+	tinykvm::Machine machine1 { binary, {
+		.max_mem = 10ull << 20, // We need 10mb because of fragmentation
+	} };
+	machine1.setup_linux({"fork"}, env);
+	machine1.prepare_copy_on_write();
+	REQUIRE(machine1.is_forkable());
+	REQUIRE(!machine1.is_forked());
+
+	tinykvm::Machine machine2 { binary, {
+		.max_mem = 10ull << 20,
+	} };
+	machine2.prepare_copy_on_write(); // No Linux setup
+	REQUIRE(machine2.is_forkable());
+	REQUIRE(!machine2.is_forked());
+
+	/// -- full resets -- ///
+
+	auto fork1 = tinykvm::Machine { machine1, {
+		.max_cow_mem = MAX_COWMEM,
+		.split_hugepages = true
+	} };
+
+	for (int i = 0; i < 100; i++)
+	{
+		fork1.run(4.0f);
+		REQUIRE(fork1.return_value() == 666);
+
+		fork1.reset_to(machine1, {
+			.max_cow_mem = 4ul << 20,
+		});
+	}
+
+	auto fork2 = tinykvm::Machine { machine2, {
+		.max_cow_mem = MAX_COWMEM,
+		.split_hugepages = true
+	} };
+
+	for (int i = 0; i < 100; i++)
+	{
+		fork2.setup_linux({"fork"}, env);
+		fork2.run(4.0f);
+		REQUIRE(fork2.return_value() == 666);
+
+		fork2.reset_to(machine2, {
+			.max_cow_mem = 4ul << 20,
+		});
+	}
+
+	/// -- keep working memory resets -- ///
+
+	auto fork3 = tinykvm::Machine { machine1, {
+		.max_cow_mem = MAX_COWMEM,
+		.split_hugepages = true
+	} };
+
+	for (int i = 0; i < 100; i++)
+	{
+		fork3.run(4.0f);
+		REQUIRE(fork3.return_value() == 666);
+
+		fork3.reset_to(machine1, {
+			.max_cow_mem = 4ul << 20,
+			.reset_keep_all_work_memory = true
+		});
+	}
+
+	auto fork4 = tinykvm::Machine { machine2, {
+		.max_cow_mem = MAX_COWMEM,
+		.split_hugepages = true
+	} };
+
+	for (int i = 0; i < 100; i++)
+	{
+		fork4.setup_linux({"fork"}, env);
+		fork4.run(4.0f);
+		REQUIRE(fork4.return_value() == 666);
+
+		fork4.reset_to(machine2, {
+			.max_cow_mem = 4ul << 20,
+			.reset_keep_all_work_memory = true
+		});
 	}
 }
