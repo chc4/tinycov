@@ -1693,13 +1693,13 @@ void Machine::setup_linux_system_calls(bool unsafe_syscalls)
 					if (flags < 0)
 						regs.rax = -errno;
 					else
-						regs.rax = flags & allowed_flags;
+						regs.rax = flags; // & allowed_flags;
 				}
 				else if (cmd == F_SETFL)
 				{
 					const int writable_fd = cpu.machine().fds().translate(vfd);
 					const int allowed_flags = O_NONBLOCK;
-					const int flags = regs.rdx & allowed_flags;
+					const int flags = regs.rdx; // & allowed_flags;
 					if (fcntl(writable_fd, F_SETFL, flags) < 0)
 					{
 						regs.rax = -errno;
@@ -2289,8 +2289,8 @@ void Machine::setup_linux_system_calls(bool unsafe_syscalls)
 						regs.rax = -errno;
 					}
 					cpu.set_registers(regs);
-					SYSPRINT("OPENAT fd=%lld path=%s (real_path=%s) = %d (%lld)\n",
-						regs.rdi, path.c_str(), real_path.c_str(), fd, regs.rax);
+					SYSPRINT("OPENAT fd=%lld (pdf=%lld) path=%s (real_path=%s) = %d (%lld)\n",
+						regs.rdi, pfd, path.c_str(), real_path.c_str(), fd, regs.rax);
 					return;
 				} catch (const std::exception& e) {
 					SYSPRINT("OPENAT failed: %s\n", e.what());
@@ -2983,13 +2983,21 @@ void Machine::setup_linux_system_calls(bool unsafe_syscalls)
 						regs.rax = -errno;
 				}
 			}
+			else if(fd == AT_FDCWD) {
+				auto cwd = cpu.machine().fds().current_working_directory();
+				if(!cpu.machine().fds().is_writable_path(cwd)) {
+					regs.rax = -EPERM;
+				} else {
+					regs.rax = utimensat(fd, path.c_str(), times, flags);
+				}
+			}
 			else
 			{
 				regs.rax = -EBADF;
 			}
 			cpu.set_registers(regs);
-			SYSPRINT("utimensat(fd=%d, path=%s, times=0x%lX, flags=%d) = %lld\n",
-					 fd, path.c_str(), g_times, flags, regs.rax);
+			SYSPRINT("utimensat(fd=%d (%d), path=%s, times=0x%lX, flags=%d) = %lld\n",
+					 fd, vfd, path.c_str(), g_times, flags, regs.rax);
 		});
 	Machine::install_syscall_handler(
 		SYS_faccessat, [](vCPU& cpu) { // faccessat
