@@ -27,7 +27,7 @@
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
 #define INSTRUMENT_DYNJUMP 0
 #define INSTRUMENT_DYNCALL 1
-#define EMIT_COVERAGE 1
+//#define EMIT_COVERAGE 1
 //#define DEBUG 0
 
 #ifdef DEBUG
@@ -719,6 +719,15 @@ int main(int argc, char** argv)
     };
     tinykvm::Machine master_vm {binary, options};
     master_vm.set_verbose_mmap_syscalls(true);
+    master_vm.set_verbose_system_calls(true);
+
+    std::string cwd;
+    {
+        char buf[PATH_MAX];
+        if (getcwd(buf, sizeof(buf)) != nullptr)
+            cwd = buf;
+    }
+    master_vm.fds().set_current_working_directory(cwd.c_str());
 
     //master_vm.print_pagetables();
     if (dyn_elf.is_dynamic) {
@@ -747,6 +756,14 @@ int main(int argc, char** argv)
                     allowed_readable_paths.end(), path) != allowed_readable_paths.end();
             }
         );
+        master_vm.fds().set_open_writable_callback(
+            [&] (std::string& path) -> bool {
+            printf("open_writable callback for %s\n", path.c_str());
+            if(getenv("ALL_PATHS")) { return true; }
+            return false;
+            }
+        );
+
     }
 
     master_vm.setup_linux(
