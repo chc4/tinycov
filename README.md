@@ -62,4 +62,13 @@ In no particular order,
 * qemuafl with drcov report: 8.98s
 * tinycov: 51.53s
 
-so yeah it's bad on hot loops
+hot loops aren't great
+
+`clang++ --help`:
+* Native: 0.034s
+* tinykvm: 0.43s
+* qemuafl: 0.47s
+* qemuafl with drcov report: 0.88s
+* tinycov: 3.29s
+
+Trying to compile real programs fails because clang++ uses `/proc/self/fd` to read files, which breaks with the VMM FD translation :[

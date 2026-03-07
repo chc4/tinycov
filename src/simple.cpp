@@ -200,10 +200,6 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
 
     dprintf("hook coverage @ %p -> %p, %p\n", pc, target_fallthrough, target_taken);
 
-    if(target_taken == 0x267be00e) {
-        dprintf("huh?\n");
-    }
-
     int i;
     char* host_code = cpu.machine().main_memory().at(pc, 0x20);
     for(i = 0; i < sizeof(trampoline_code); i++) {
