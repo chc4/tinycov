@@ -27,6 +27,10 @@
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
 #define INSTRUMENT_DYNJUMP 0
 #define INSTRUMENT_DYNCALL 1
+#define ENTRY_TRACING 1
+// TODO: this is buggy and causes spurious crashes, i suspect due to falling through
+// the end of hooked blocks to the next page which triggers a fault
+#define UNEXEC_TRACING 1
 #define EMIT_COVERAGE 1
 //#define DEBUG 1
 
@@ -86,7 +90,7 @@ struct TrampolinePage *allocate_trampoline(tinykvm::Machine& machine) {
     uint64_t guest_addr = machine.mmap_allocate(0x1000, 0x7, false);
     page_at(machine.main_memory(), guest_addr, [] (uint64_t addr, uint64_t& entry, size_t size) {
         // Make the page executable by the user (There is probably a better way to do this?)
-        entry = entry & ~PDE64_NX;
+        entry = entry & ~PDE64_NX | PDE64_DIRTY;
     });
 
 
@@ -283,6 +287,7 @@ static void hook_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
 
 static roaring::Roaring seen = {};
 static std::vector<uintptr_t> blocks {};
+static roaring::Roaring unexec_pages;
 static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
 
     csh handle;
@@ -316,8 +321,23 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
         size_t off = 0;
         bool hit_branch = false;
         while(off < 0x2000 && !hit_branch) {
+            if constexpr(UNEXEC_TRACING) {
+                size_t inst_page = (entry + off) & ~(PAGE_SIZE-1);
+                if(unexec_pages.contains(inst_page)) {
+                    unexec_pages.remove(inst_page);
+                    // When we get an unexec hit, we will start executing the start of a block. That block
+                    // may cross into another page, however, and we also need to make it executable again
+                    // so that we don't potentially treat the page boundary as the start of another basic block.
+                    printf("hook_block unexec clear %p\n", entry + off);
+                    page_at(cpu.machine().main_memory(), entry + off,
+                            [&] (uint64_t addr, uint64_t& entry, size_t size)
+                    {
+                        entry = entry & ~PDE64_NX | PDE64_DIRTY;
+                    }, true);
+                }
+            }
             // disassemble one inst at a time until we hit the end of the basic block
-            count = cs_disasm(handle, (const uint8_t*)(prog_mem + off), 0x200, (uint64_t)(uintptr_t)(entry + off), 1, &insn);
+            count = cs_disasm(handle, (const uint8_t*)(prog_mem + off), 0x1000, (uint64_t)(uintptr_t)(entry + off), 1, &insn);
             if (count > 0) {
                 assert(count == 1);
                 size_t j;
@@ -553,7 +573,6 @@ static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, ui
 }
 
 static uint64_t coverage_vmexit_count = 0;
-static roaring::Roaring unexec_pages;
 
 static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     uint64_t start_address = machine.registers().rip;
@@ -567,48 +586,50 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     print_gdt_entries(machine.main_memory().at(machine.get_special_registers().gdt.base), 7);
     machine.print_exception_handlers();
 
-    // Force mmap to not allocate executable memory, so that we always catch the first
-    // jumps to code pages at least
-    machine.set_mmap_callback([] (tinykvm::vCPU& cpu, size_t addr, size_t length, int flags, int prot, int read_fd, size_t voff) {
-        auto allocated = addr;
-        if(allocated == 0) {allocated = cpu.registers().rax; }
-        if(allocated == (size_t)MAP_FAILED) { return; }
-        printf("mmap callback, %p %x\n", allocated, length);
+    if(UNEXEC_TRACING) {
+        // Force mmap to not allocate executable memory, so that we always catch the first
+        // jumps to code pages at least
+        machine.set_mmap_callback([] (tinykvm::vCPU& cpu, size_t addr, size_t length, int flags, int prot, int read_fd, size_t voff) {
+            auto allocated = addr;
+            if(allocated == 0) {allocated = cpu.registers().rax; }
+            if(allocated == (size_t)MAP_FAILED) { return; }
+            printf("mmap callback, %p %x\n", allocated, length);
 
-        if(prot & PROT_EXEC) {
-            for(int i = 0; i < (length-1); i += 0x1000) {
-                printf("fresh page %p\n", allocated + i);
-                page_at(cpu.machine().main_memory(), allocated + i,
-                        [] (uint64_t addr, uint64_t& entry, size_t size)
-                {
-                    entry = entry | PDE64_NX;
-                    printf("entry = %x\n", entry);
-                }, true);
-                (void)*cpu.machine().main_memory().safely_at(allocated + i, 0x1000);
-                unexec_pages.addRange(allocated + i, allocated + i + 4096 - 1);
+            if(prot & PROT_EXEC) {
+                unexec_pages.add(allocated);
+                for(int i = 0; i < (length-1); i += 0x1000) {
+                    page_at(cpu.machine().main_memory(), allocated + i,
+                            [] (uint64_t addr, uint64_t& entry, size_t size)
+                    {
+                        entry = entry | PDE64_NX | PDE64_DIRTY;
+                    });
+                    (void)*cpu.machine().main_memory().safely_at(allocated + i, 0x1000);
+                    unexec_pages.add(allocated + i);
+                }
+                printf("unexec %p\n", allocated);
             }
-            printf("unexec %p\n", allocated);
-        }
-    });
+        });
 
-    machine.set_page_fault_callback([] (tinykvm::vCPU& cpu, size_t page) {
-        printf("page fault\n");
-        bool unexec = false;
-        auto address = cpu.get_special_registers().cr2;
-        if(unexec_pages.contains(page)) {
-            printf("unexec pf @ %x (%x)\n", page, address);
-            hook_block(cpu, address);
-        }
-        page_at(cpu.machine().main_memory(), page,
-                [&] (uint64_t addr, uint64_t& entry, size_t size)
-        {
-            printf("pf entry = %x\n", entry);
-            entry = entry & ~PDE64_NX;
-            unexec = true;
-        }, true);
+        machine.set_page_fault_callback([] (tinykvm::vCPU& cpu, size_t page) {
+            printf("page fault\n");
+            bool unexec = false;
+            auto address = cpu.get_special_registers().cr2;
+            if(unexec_pages.contains(page)) {
+                printf("unexec pf @ %x (%x)\n", page, address);
+                unexec_pages.remove(page);
+                hook_block(cpu, address);
+            }
+            page_at(cpu.machine().main_memory(), page,
+                    [&] (uint64_t addr, uint64_t& entry, size_t size)
+            {
+                printf("pf entry = %x\n", entry);
+                entry = entry & ~PDE64_NX | PDE64_DIRTY;
+                unexec = true;
+            }, true);
 
-        return unexec;
-    });
+            return unexec;
+        });
+    }
 
     collect_state_guest = machine.mmap_allocate(0x1000, 0x7, false);
     collect_state = (struct CollectorState *)machine.main_memory().at(collect_state_guest,
@@ -678,7 +699,9 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     //    allocate_trampoline(machine);
     //}
 
-    //hook_block(machine.cpu(), start_address);
+    if(ENTRY_TRACING) {
+        hook_block(machine.cpu(), start_address);
+    }
 
     return 0;
 }
@@ -757,6 +780,12 @@ int main(int argc, char** argv)
         .remappings {remappings},
         .verbose_loader = true,
         .hugepages = (getenv("HUGE") != nullptr),
+
+        // For NX based basic block discovery, having hugepages means we miss
+        // many more other blocks once we trap one page.
+        //.split_hugepages = true,
+        .split_all_hugepages_during_loading = true,
+
         .relocate_fixed_mmap = (getenv("GO") == nullptr),
         .executable_heap = dyn_elf.is_dynamic,
     };
