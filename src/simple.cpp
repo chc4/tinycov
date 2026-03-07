@@ -27,8 +27,8 @@
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
 #define INSTRUMENT_DYNJUMP 0
 #define INSTRUMENT_DYNCALL 1
-//#define EMIT_COVERAGE 1
-//#define DEBUG 0
+#define EMIT_COVERAGE 1
+//#define DEBUG 1
 
 #ifdef DEBUG
 #define dprintf printf
@@ -553,9 +553,11 @@ static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, ui
 }
 
 static uint64_t coverage_vmexit_count = 0;
+static roaring::Roaring unexec_pages;
+
 static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     uint64_t start_address = machine.registers().rip;
-    dprintf("elf start @ %p\n", start_address);
+    dprintf("elf start @ %p, %p\n", start_address, machine.entry_address());
     char *entry_mem = machine.main_memory().at(start_address, sizeof(uint32_t));
     ////*((uint8_t*)entry_mem + 0) = 0x90;
     //*((uint8_t*)entry_mem + 1) = 0x90;
@@ -565,6 +567,48 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     print_gdt_entries(machine.main_memory().at(machine.get_special_registers().gdt.base), 7);
     machine.print_exception_handlers();
 
+    // Force mmap to not allocate executable memory, so that we always catch the first
+    // jumps to code pages at least
+    machine.set_mmap_callback([] (tinykvm::vCPU& cpu, size_t addr, size_t length, int flags, int prot, int read_fd, size_t voff) {
+        auto allocated = addr;
+        if(allocated == 0) {allocated = cpu.registers().rax; }
+        if(allocated == (size_t)MAP_FAILED) { return; }
+        printf("mmap callback, %p %x\n", allocated, length);
+
+        if(prot & PROT_EXEC) {
+            for(int i = 0; i < (length-1); i += 0x1000) {
+                printf("fresh page %p\n", allocated + i);
+                page_at(cpu.machine().main_memory(), allocated + i,
+                        [] (uint64_t addr, uint64_t& entry, size_t size)
+                {
+                    entry = entry | PDE64_NX;
+                    printf("entry = %x\n", entry);
+                }, true);
+                (void)*cpu.machine().main_memory().safely_at(allocated + i, 0x1000);
+                unexec_pages.addRange(allocated + i, allocated + i + 4096 - 1);
+            }
+            printf("unexec %p\n", allocated);
+        }
+    });
+
+    machine.set_page_fault_callback([] (tinykvm::vCPU& cpu, size_t page) {
+        printf("page fault\n");
+        bool unexec = false;
+        auto address = cpu.get_special_registers().cr2;
+        if(unexec_pages.contains(page)) {
+            printf("unexec pf @ %x (%x)\n", page, address);
+            hook_block(cpu, address);
+        }
+        page_at(cpu.machine().main_memory(), page,
+                [&] (uint64_t addr, uint64_t& entry, size_t size)
+        {
+            printf("pf entry = %x\n", entry);
+            entry = entry & ~PDE64_NX;
+            unexec = true;
+        }, true);
+
+        return unexec;
+    });
 
     collect_state_guest = machine.mmap_allocate(0x1000, 0x7, false);
     collect_state = (struct CollectorState *)machine.main_memory().at(collect_state_guest,
@@ -577,7 +621,6 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
 
     ((tinykvm::iasm_header*)machine.main_memory().at(
         machine.main_memory().physbase + tinykvm::INTR_ASM_ADDR))->vm64_coverage_state = collect_state_guest;
-
 
     machine.install_output_handler([](tinykvm::vCPU& cpu, unsigned int io_port, unsigned int val) {
         if(io_port != 0x20) { return; }
@@ -635,7 +678,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     //    allocate_trampoline(machine);
     //}
 
-    hook_block(machine.cpu(), start_address);
+    //hook_block(machine.cpu(), start_address);
 
     return 0;
 }
@@ -749,9 +792,22 @@ int main(int argc, char** argv)
             "/lib/x86_64-linux-gnu/glibc-hwcaps/x86-64-v3/libstdc++.so.6",
             "/lib/x86_64-linux-gnu/glibc-hwcaps/x86-64-v4/libstdc++.so.6",
         });
+
+        auto translate = [](tinykvm::Machine& machine, std::string& path) {
+            if(path.find("/proc/self/fd/") != std::string::npos) {
+                uint64_t fd = std::stoi(path.substr(14));
+                fd = machine.fds().translate(fd);
+                path.assign(std::string("/proc/self/fd/"));
+                path.append(std::to_string(fd));
+                printf("new path %s\n", path.c_str());
+                return true;
+            }
+            return false;
+        };
+
         master_vm.fds().set_open_readable_callback(
             [&] (std::string& path) -> bool {
-            if(getenv("ALL_PATHS")) { return true; }
+            if(getenv("ALL_PATHS")) { translate(master_vm, path); return true; }
                 return std::find(allowed_readable_paths.begin(),
                     allowed_readable_paths.end(), path) != allowed_readable_paths.end();
             }
@@ -763,7 +819,16 @@ int main(int argc, char** argv)
             return false;
             }
         );
-
+        master_vm.fds().set_resolve_symlink_callback(
+            [&] (std::string& path) -> bool {
+            printf("resolve_symlink callback for %s\n", path.c_str());
+            if(getenv("ALL_PATHS")) {
+                translate(master_vm, path);
+                return false;
+            } else {
+                return false;
+            }
+        });
     }
 
     master_vm.setup_linux(

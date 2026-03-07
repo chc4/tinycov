@@ -498,9 +498,10 @@ namespace tinykvm
 				}
 				return true;
 			}
-		}
-		if (UNLIKELY(this->m_verbose)) {
-			fprintf(stderr, "TinyKVM: %s is not a symlink\n", modifiable_path.c_str());
+			if (UNLIKELY(this->m_verbose)) {
+				fprintf(stderr, "TinyKVM: %s is not a symlink\n", modifiable_path.c_str());
+			}
+			return false;
 		}
 		return false;
 	}

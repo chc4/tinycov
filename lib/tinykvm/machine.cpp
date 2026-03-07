@@ -19,6 +19,7 @@ namespace tinykvm {
 	Machine::syscall_t Machine::m_on_breakpoint = [] (vCPU&) {};
 	Machine::io_callback_t Machine::m_on_input = [] (vCPU&, unsigned, unsigned) {};
 	Machine::io_callback_t Machine::m_on_output = [] (vCPU&, unsigned, unsigned) {};
+	Machine::page_fault_t Machine::m_on_page_fault = [] (vCPU&, address_t) { return false; };
 	Machine::printer_func Machine::m_default_printer =
 		[] (const char* buffer, size_t len) {
 			printf("%.*s", (int)len, buffer);

@@ -1,4 +1,5 @@
 #include "machine.hpp"
+#include <cstring>
 
 namespace tinykvm {
 static constexpr size_t MMAP_COLLISION_TRESHOLD = 512ULL << 20; // 512MB
@@ -220,6 +221,7 @@ Machine::address_t Machine::mmap_fixed_allocate(uint64_t addr, size_t bytes, boo
 
 	// Make sure there is no free range in the way
 	mmap_cache().remove_free(addr, bytes);
+	memset(main_memory().at(addr), 0, bytes);
 
 	if (this->mmap_cache().track_used_ranges())
 	{

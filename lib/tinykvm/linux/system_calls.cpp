@@ -669,7 +669,6 @@ void Machine::setup_linux_system_calls(bool unsafe_syscalls)
 			std::vector<tinykvm::Machine::WrBuffer> buffers;
 			const auto bufcount =
 				cpu.machine().writable_buffers_from_range(buffers, g_buf, bytes);
-
 			ssize_t result =
 				preadv64(fd, (iovec *)&buffers[0], bufcount, offset);
 			if (result < 0) {
@@ -1910,8 +1909,8 @@ void Machine::setup_linux_system_calls(bool unsafe_syscalls)
 				}
 			}
 			cpu.set_registers(regs);
-			SYSPRINT("readlink(%s (0x%llX), buf=0x%lX, bufsiz=%zu) = %lld\n",
-					 path.c_str(), regs.rdi, g_buf, bufsiz, regs.rax);
+			SYSPRINT("readlink(%s (0x%llX), buf=0x%lX, bufsiz=%zu) = %lld (%s)\n",
+					 path.c_str(), regs.rdi, g_buf, bufsiz, regs.rax, buf.data());
 		});
 	Machine::install_syscall_handler(
 		SYS_fchmod, [](vCPU& cpu) { // FCHMOD

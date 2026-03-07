@@ -349,6 +349,10 @@ long vCPU::run_once()
 					this->handle_exception(intr);
 					Machine::machine_exception("Page fault repeat on same address", intr);
 				}
+				if(machine().m_on_page_fault(*this, addr)) {
+					// User callback handled the page fault
+					return KVM_EXIT_IO;
+				}
 				this->last_fault_address = addr;
 				if constexpr (false) {
 					char buffer[256];

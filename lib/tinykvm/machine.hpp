@@ -18,11 +18,12 @@ namespace tinykvm {
 struct Machine
 {
 	using address_t = uint64_t;
-	using syscall_t = void(*)(vCPU&);
-	using numbered_syscall_t = void(*)(vCPU&, unsigned);
 	using io_callback_t = void(*)(vCPU&, unsigned, unsigned);
-	using printer_func = std::function<void(const char*, size_t)>;
 	using mmap_func_t = std::function<void(vCPU&, address_t, size_t, int, int, int, address_t)>;
+	using numbered_syscall_t = void(*)(vCPU&, unsigned);
+	using page_fault_t = bool(*)(vCPU&, address_t);
+	using printer_func = std::function<void(const char*, size_t)>;
+	using syscall_t = void(*)(vCPU&);
 
 	/* Setup Linux env and run through main */
 	void setup_argv(const std::vector<std::string>& args,
@@ -179,6 +180,7 @@ struct Machine
 	bool mmap_relax(uint64_t addr, size_t size, size_t new_size);
 	void do_mmap_callback(vCPU&, address_t, size_t, int, int, int, address_t);
 	void set_mmap_callback(mmap_func_t f) { m_mmap_func = std::move(f); }
+	void set_page_fault_callback(page_fault_t f) { m_on_page_fault = std::move(f); }
 
 	uint64_t address_of(std::string_view symbol, const std::vector<uint8_t>&) const;
 	uint64_t address_of(std::string_view symbol, std::string_view binary = {}) const;
@@ -378,12 +380,13 @@ private:
 	printer_func m_printer = m_default_printer;
 
 	static std::array<syscall_t, TINYKVM_MAX_SYSCALLS> m_syscalls;
-	static numbered_syscall_t m_unhandled_syscall;
-	static syscall_t          m_on_breakpoint;
 	static io_callback_t      m_on_input;
 	static io_callback_t      m_on_output;
-	static printer_func       m_default_printer;
 	static mmap_func_t        m_mmap_func;
+	static numbered_syscall_t m_unhandled_syscall;
+	static page_fault_t       m_on_page_fault;
+	static printer_func       m_default_printer;
+	static syscall_t          m_on_breakpoint;
 
 	static int create_kvm_vm();
 	static int kvm_fd;
