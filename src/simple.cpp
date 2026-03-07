@@ -27,9 +27,7 @@
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
 #define INSTRUMENT_DYNJUMP 0
 #define INSTRUMENT_DYNCALL 1
-#define ENTRY_TRACING 1
-// TODO: this is buggy and causes spurious crashes, i suspect due to falling through
-// the end of hooked blocks to the next page which triggers a fault
+#define ENTRY_TRACING 0
 #define UNEXEC_TRACING 1
 //#define EMIT_COVERAGE 1
 //#define DEBUG 1
@@ -134,21 +132,20 @@ struct TrampolinePage *find_trampoline(tinykvm::vCPU& cpu, uint16_t disp, uint16
     return page;
 }
 
+struct __attribute__((packed)) trampoline_branch {
+    uint8_t jcc;
+    uint8_t disp;
+
+    uint8_t jcc_fallthrough;
+    uint32_t disp_fallthrough;
+
+    uint8_t jcc_taken;
+    uint32_t disp_taken;
+};
+static_assert(sizeof(struct trampoline_branch) == 12);
 static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     // Install coverage hook on a branch exit of a basic block
-    struct __attribute__((packed)) trampoline_bytes {
-        uint8_t jcc;
-        uint8_t disp;
-
-        uint8_t jcc_fallthrough;
-        uint32_t disp_fallthrough;
-
-        uint8_t jcc_taken;
-        uint32_t disp_taken;
-    };
-    static_assert(sizeof(struct trampoline_bytes) == 12);
-
-    struct trampoline_bytes trampoline_code = {};
+    struct trampoline_branch trampoline_code = {};
     dprintf("hooking @ %x\n", pc);
     uint16_t inst_disp = pc % TRAMPOLINE_SIZE;
     size_t start_page = (pc / TRAMPOLINE_SIZE);
@@ -202,6 +199,10 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     trampoline_code.disp_taken = (int32_t)taken_offset;
 
     dprintf("hook coverage @ %p -> %p, %p\n", pc, target_fallthrough, target_taken);
+
+    if(target_taken == 0x267be00e) {
+        dprintf("huh?\n");
+    }
 
     int i;
     char* host_code = cpu.machine().main_memory().at(pc, 0x20);
@@ -320,22 +321,7 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
         char *prog_mem = cpu.machine().main_memory().at(entry, 0x2000);
         size_t off = 0;
         bool hit_branch = false;
-        while(off < 0x2000 && !hit_branch) {
-            if constexpr(UNEXEC_TRACING) {
-                size_t inst_page = (entry + off) & ~(PAGE_SIZE-1);
-                if(unexec_pages.contains(inst_page)) {
-                    unexec_pages.remove(inst_page);
-                    // When we get an unexec hit, we will start executing the start of a block. That block
-                    // may cross into another page, however, and we also need to make it executable again
-                    // so that we don't potentially treat the page boundary as the start of another basic block.
-                    dprintf("hook_block unexec clear %p\n", entry + off);
-                    page_at(cpu.machine().main_memory(), entry + off,
-                            [&] (uint64_t addr, uint64_t& entry, size_t size)
-                    {
-                        entry = entry & ~PDE64_NX | PDE64_DIRTY;
-                    }, true);
-                }
-            }
+        while(off < (0x2000-12) && !hit_branch) {
             // disassemble one inst at a time until we hit the end of the basic block
             count = cs_disasm(handle, (const uint8_t*)(prog_mem + off), 0x1000, (uint64_t)(uintptr_t)(entry + off), 1, &insn);
             if (count > 0) {
@@ -432,11 +418,10 @@ static void hit_fresh_branch(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *selector
     assert(page.present.contains(inst_disp));
 
 
-    uint8_t (*trampoline_code)[12] = (uint8_t(*)[12])(page.host_addr + inst_disp);
+    struct trampoline_branch *trampoline_code = (struct trampoline_branch*)(page.host_addr + inst_disp);
 
-    int32_t fallthrough_offset = *(int32_t*)&(*trampoline_code)[3];
-    int32_t taken_offset = 0;
-    memcpy(&taken_offset, &(*trampoline_code)[8], sizeof(taken_offset));
+    int32_t fallthrough_offset = trampoline_code->disp_fallthrough;
+    int32_t taken_offset = trampoline_code->disp_taken;;
 
     uint32_t target_fallthrough = page.guest_addr + inst_disp + 7 + fallthrough_offset;
     uint32_t target_taken = page.guest_addr + inst_disp + 12 + taken_offset;
@@ -595,9 +580,12 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
             if(allocated == (size_t)MAP_FAILED) { return; }
             dprintf("mmap callback, %p %x\n", allocated, length);
 
+
             if(prot & PROT_EXEC) {
                 unexec_pages.add(allocated);
                 for(int i = 0; i < (length-1); i += 0x1000) {
+                    // XXX: DEBUG
+                    //if(allocated + i == 0x267be000) { continue; }
                     page_at(cpu.machine().main_memory(), allocated + i,
                             [] (uint64_t addr, uint64_t& entry, size_t size)
                     {
@@ -611,21 +599,28 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         });
 
         machine.set_page_fault_callback([] (tinykvm::vCPU& cpu, size_t page) {
-            dprintf("page fault\n");
+            uint64_t code;
+            uint64_t rip;
+            // Only handle NX-bit faults
+            cpu.machine().unsafe_copy_from_guest(&code, cpu.registers().rsp+16,  8);
+            if(code & 0x10 == 0) { return false; }
+            // We need to use the guest RIP, not the fault address, because the instruction
+            // may straddle the page boundary.
+            cpu.machine().unsafe_copy_from_guest(&rip, cpu.registers().rsp+24,  8);
+            dprintf("page fault, rip=%x page=%x code=%x\n", rip, page, code);
             bool unexec = false;
-            auto address = cpu.get_special_registers().cr2;
             if(unexec_pages.contains(page)) {
-                dprintf("unexec pf @ %x (%x)\n", page, address);
+                dprintf("unexec pf @ %x (%x)\n", page, rip);
                 unexec_pages.remove(page);
-                hook_block(cpu, address);
+                hook_block(cpu, rip);
+                page_at(cpu.machine().main_memory(), page,
+                        [&] (uint64_t addr, uint64_t& entry, size_t size)
+                {
+                    dprintf("pf entry = %x\n", entry);
+                    entry = entry & ~PDE64_NX | PDE64_DIRTY;
+                    unexec = true;
+                }, true);
             }
-            page_at(cpu.machine().main_memory(), page,
-                    [&] (uint64_t addr, uint64_t& entry, size_t size)
-            {
-                dprintf("pf entry = %x\n", entry);
-                entry = entry & ~PDE64_NX | PDE64_DIRTY;
-                unexec = true;
-            }, true);
 
             return unexec;
         });
