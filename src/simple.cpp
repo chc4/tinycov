@@ -31,7 +31,7 @@
 // TODO: this is buggy and causes spurious crashes, i suspect due to falling through
 // the end of hooked blocks to the next page which triggers a fault
 #define UNEXEC_TRACING 1
-#define EMIT_COVERAGE 1
+//#define EMIT_COVERAGE 1
 //#define DEBUG 1
 
 #ifdef DEBUG
@@ -328,7 +328,7 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
                     // When we get an unexec hit, we will start executing the start of a block. That block
                     // may cross into another page, however, and we also need to make it executable again
                     // so that we don't potentially treat the page boundary as the start of another basic block.
-                    printf("hook_block unexec clear %p\n", entry + off);
+                    dprintf("hook_block unexec clear %p\n", entry + off);
                     page_at(cpu.machine().main_memory(), entry + off,
                             [&] (uint64_t addr, uint64_t& entry, size_t size)
                     {
@@ -593,7 +593,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
             auto allocated = addr;
             if(allocated == 0) {allocated = cpu.registers().rax; }
             if(allocated == (size_t)MAP_FAILED) { return; }
-            printf("mmap callback, %p %x\n", allocated, length);
+            dprintf("mmap callback, %p %x\n", allocated, length);
 
             if(prot & PROT_EXEC) {
                 unexec_pages.add(allocated);
@@ -606,23 +606,23 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
                     (void)*cpu.machine().main_memory().safely_at(allocated + i, 0x1000);
                     unexec_pages.add(allocated + i);
                 }
-                printf("unexec %p\n", allocated);
+                dprintf("unexec %p\n", allocated);
             }
         });
 
         machine.set_page_fault_callback([] (tinykvm::vCPU& cpu, size_t page) {
-            printf("page fault\n");
+            dprintf("page fault\n");
             bool unexec = false;
             auto address = cpu.get_special_registers().cr2;
             if(unexec_pages.contains(page)) {
-                printf("unexec pf @ %x (%x)\n", page, address);
+                dprintf("unexec pf @ %x (%x)\n", page, address);
                 unexec_pages.remove(page);
                 hook_block(cpu, address);
             }
             page_at(cpu.machine().main_memory(), page,
                     [&] (uint64_t addr, uint64_t& entry, size_t size)
             {
-                printf("pf entry = %x\n", entry);
+                dprintf("pf entry = %x\n", entry);
                 entry = entry & ~PDE64_NX | PDE64_DIRTY;
                 unexec = true;
             }, true);
@@ -790,8 +790,8 @@ int main(int argc, char** argv)
         .executable_heap = dyn_elf.is_dynamic,
     };
     tinykvm::Machine master_vm {binary, options};
-    master_vm.set_verbose_mmap_syscalls(true);
-    master_vm.set_verbose_system_calls(true);
+    //master_vm.set_verbose_mmap_syscalls(true);
+    //master_vm.set_verbose_system_calls(true);
 
     std::string cwd;
     {
@@ -828,7 +828,7 @@ int main(int argc, char** argv)
                 fd = machine.fds().translate(fd);
                 path.assign(std::string("/proc/self/fd/"));
                 path.append(std::to_string(fd));
-                printf("new path %s\n", path.c_str());
+                dprintf("new path %s\n", path.c_str());
                 return true;
             }
             return false;
@@ -843,14 +843,14 @@ int main(int argc, char** argv)
         );
         master_vm.fds().set_open_writable_callback(
             [&] (std::string& path) -> bool {
-            printf("open_writable callback for %s\n", path.c_str());
+            dprintf("open_writable callback for %s\n", path.c_str());
             if(getenv("ALL_PATHS")) { return true; }
             return false;
             }
         );
         master_vm.fds().set_resolve_symlink_callback(
             [&] (std::string& path) -> bool {
-            printf("resolve_symlink callback for %s\n", path.c_str());
+            dprintf("resolve_symlink callback for %s\n", path.c_str());
             if(getenv("ALL_PATHS")) {
                 translate(master_vm, path);
                 return false;

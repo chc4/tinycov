@@ -50,3 +50,16 @@ In no particular order,
 - [ ] LibAFL fuzzing provider
 - [ ] Saturated edge unhooking
     - If we see both exits from a block, we can uninstall the coverage hook from it since it can't contribute new edges to later runs
+
+
+# Benchmark
+
+`bzip2` on 4Mb of random data:
+
+* Native: 0.40s
+* tinykvm: 0.45s
+* qemuafl: 1.85s
+* qemuafl with drcov report: 8.98s
+* tinycov: 51.53s
+
+so yeah it's bad on hot loops
