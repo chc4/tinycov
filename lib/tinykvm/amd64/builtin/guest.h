@@ -5,9 +5,10 @@
 // We will never have a FRESH DYNJUMP, because dynamic dispatch hooks must always
 // be considered fresh: we always need to try and follow the targets at runtime.
 #define COVERAGE_FRESH (0x80) // Mark unhit branch hooks
-#define COVERAGE_DYNJUMP (0x40) // Mark dynamic dispatch jump instructions
-#define COVERAGE_DYNCALL (0xc0) // Mark dynamic dispatch call instructions
-#define COVERAGE_BITS (COVERAGE_FRESH | COVERAGE_DYNJUMP | COVERAGE_DYNCALL)
+//#define COVERAGE_DYNJUMP (0x40) // Mark dynamic dispatch jump instructions
+#define COVERAGE_CMPCOV (0x20) // Mark dynamic dispatch jump instructions
+#define COVERAGE_DYNCALL (0x40) // Mark dynamic dispatch call instructions
+#define COVERAGE_BITS (COVERAGE_FRESH | COVERAGE_CMPCOV | COVERAGE_DYNCALL)
 #define TRAMPOLINE_SIZE (0x1000 - 12) // Number of bytes in each trampoline page
 #define COVERAGE_BITMAP_SIZE (0x1000) // Number of bytes in the coverage bitmap
 

@@ -27,6 +27,7 @@
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
 #define INSTRUMENT_DYNJUMP 0
 #define INSTRUMENT_DYNCALL 1
+#define INSTRUMENT_CMPCOV 1
 #define ENTRY_TRACING 1
 #define UNEXEC_TRACING 1
 #define EMIT_COVERAGE 0
@@ -143,7 +144,19 @@ struct __attribute__((packed)) trampoline_branch {
     uint32_t disp_taken;
 };
 static_assert(sizeof(struct trampoline_branch) == 12);
-static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
+static std::set<uint64_t> dictionary {};
+static std::map<uintptr_t, uintptr_t> cmpcov_operand {};
+struct cmpcov_state {
+    bool present;
+    uintptr_t exit;
+    uintptr_t cmp;
+    bool has_reg;
+    x86_reg reg1;
+    x86_reg reg2;
+};
+
+static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst, cmpcov_state *cmpcov) {
+    cmpcov->exit = pc;
     // Install coverage hook on a branch exit of a basic block
     struct trampoline_branch trampoline_code = {};
     dprintf("hooking @ %x\n", pc);
@@ -200,6 +213,7 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
 
     dprintf("hook coverage @ %p -> %p, %p\n", pc, target_fallthrough, target_taken);
 
+
     int i;
     char* host_code = cpu.machine().main_memory().at(pc, 0x20);
     for(i = 0; i < sizeof(trampoline_code); i++) {
@@ -216,6 +230,13 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     *(host_code + 0) = 0xcc;
     // Replace second byte with page selector, and mark it as fresh
     *(host_code + 1) = page->index | COVERAGE_FRESH;
+
+    if(cmpcov->present && cmpcov->has_reg) {
+        printf("collecting cmpcov operand for %x\n", pc);
+        cmpcov_operand[pc] = cmpcov->cmp;
+        *(host_code + 1) = *(host_code + 1) | COVERAGE_CMPCOV;
+    }
+
     dprintf("marked present %x--%x\n", inst_disp, inst_disp + i);
 }
 
@@ -290,6 +311,7 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
     csh handle;
     cs_insn *insn;
     size_t count;
+    cmpcov_state cmpcov = { .present = false };
     if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK)
         return;
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
@@ -310,6 +332,7 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
         goto cleanup;
     }
 
+    cmpcov.present = false;
     while(blocks.size() > 0) {
         uintptr_t entry = blocks.at(blocks.size() - 1);
         blocks.pop_back();
@@ -342,6 +365,24 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
                         hit_branch = true;
                         break;
                     }
+                    if(INSTRUMENT_CMPCOV && strcmp(i->mnemonic, "cmp") == 0) {
+                        // Record last cmp as the cmpcov state for this block's exit
+                        cmpcov = {
+                            .present = true,
+                            .cmp = i->address,
+                        };
+
+                        if(i->detail->x86.operands[1].type == X86_OP_IMM) {
+                            auto magic = i->detail->x86.operands[1].imm;
+                            printf("cmpcov static magic: %x\n", magic);
+                            dictionary.insert(i->detail->x86.operands[1].imm);
+                        } else if(i->detail->x86.operands[1].size == 4 || i->detail->x86.operands[1].size == 8) {
+                            // <16bit operands are small enough that a fuzzer will
+                            // find them just by guessing fast enough to not matter.
+                            cmpcov.has_reg = true;
+                        }
+                        break;
+                    }
                     cs_detail *detail = i->detail;
                     if (detail->groups_count > 0) {
                         dprintf("\tinstruction group: ");
@@ -372,7 +413,7 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
                                         // Follow both sides of the branch
                                         //add_exit(i->address + i->size);
                                         //add_exit(dest);
-                                        hook_branch(cpu, i->address, i);
+                                        hook_branch(cpu, i->address, i, &cmpcov);
                                         hit_branch = true;
                                         break;
                                     }
@@ -395,6 +436,7 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
             }
 
             if(hit_branch) {
+                cmpcov.present = false;
                 break;
             }
         }
@@ -406,7 +448,7 @@ cleanup:
 
 static void hit_fresh_branch(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *selector) {
     // We hit the coverage hook of a block exit for the first time
-    uint32_t index = *selector & ~COVERAGE_FRESH;
+    uint32_t index = *selector & ~COVERAGE_BITS;
     // Find the two successors of this coverage branch by looking at our own trampoline
     // instructions, which have displacements we can easily read out.
     uintptr_t inst_disp = pc % TRAMPOLINE_SIZE;
@@ -462,6 +504,26 @@ uint64_t get_register_value(const tinykvm::tinykvm_x86regs *regs, x86_reg reg) {
         case X86_REG_EDI: return regs->rdi & 0xFFFFFFFF;
         case X86_REG_EBP: return regs->rbp & 0xFFFFFFFF;
         case X86_REG_ESP: return regs->rsp & 0xFFFFFFFF;
+        case X86_REG_R8D:  return regs->r8 & 0xFFFFFFFF;
+        case X86_REG_R9D:  return regs->r9 & 0xFFFFFFFF;
+        case X86_REG_R10D: return regs->r10 & 0xFFFFFFFF;
+        case X86_REG_R11D: return regs->r11 & 0xFFFFFFFF;
+        case X86_REG_R12D: return regs->r12 & 0xFFFFFFFF;
+        case X86_REG_R13D: return regs->r13 & 0xFFFFFFFF;
+        case X86_REG_R14D: return regs->r14 & 0xFFFFFFFF;
+        case X86_REG_R15D: return regs->r15 & 0xFFFFFFFF;
+
+
+        // 16-bit registers (zero-extended)
+        case X86_REG_AL: return regs->rax & 0xFFFF;
+        case X86_REG_BL: return regs->rbx & 0xFFFF;
+        case X86_REG_CL: return regs->rcx & 0xFFFF;
+        case X86_REG_DL: return regs->rdx & 0xFFFF;
+        case X86_REG_AH: return regs->rax & 0xFFFF0000;
+        case X86_REG_BH: return regs->rbx & 0xFFFF0000;
+        case X86_REG_CH: return regs->rcx & 0xFFFF0000;
+        case X86_REG_DH: return regs->rdx & 0xFFFF0000;
+
 
         case X86_REG_INVALID:
         default:
@@ -482,10 +544,8 @@ uint64_t get_register_value(const tinykvm::tinykvm_x86regs *regs, x86_reg reg) {
  */
 typedef int (*read_memory_fn)(uint64_t address, void *buffer, size_t size, void *user_data);
 
-int resolve_target(tinykvm::vMemory& memory, cs_insn *insn, tinykvm::tinykvm_x86regs *regs, uint64_t *target) {
-    cs_x86_op *op = &insn->detail->x86.operands[0];
-    dprintf("resolving dynamic target %s\n", insn->op_str);
 
+int resolve_operand(tinykvm::vMemory& memory, cs_x86_op *op, tinykvm::tinykvm_x86regs *regs, uint64_t *target) {
     switch (op->type) {
         case X86_OP_REG:
             *target = get_register_value(regs, op->reg);
@@ -511,7 +571,14 @@ int resolve_target(tinykvm::vMemory& memory, cs_insn *insn, tinykvm::tinykvm_x86
     return -1;
 }
 
+int resolve_target(tinykvm::vMemory& memory, cs_insn *insn, tinykvm::tinykvm_x86regs *regs, uint64_t *target) {
+    cs_x86_op *op = &insn->detail->x86.operands[0];
+    dprintf("resolving dynamic target %s\n", insn->op_str);
+    return resolve_operand(memory, op, regs, target);
+}
+
 static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, uint8_t *selector) {
+    assert(INSTRUMENT_DYNCALL);
     auto guest_frame = cpu.registers().rdi;
     auto host_frame = (struct stack_frame*)cpu.machine().main_memory().at(guest_frame, sizeof(struct stack_frame));
     // guest_rsp is the guest *kernel* stack. we need to get the guest user rsp
@@ -551,6 +618,33 @@ static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, ui
     cs_close(&handle);
     hook_block(cpu, target);
     return target;
+}
+
+static void hit_cmpcov(tinykvm::vCPU& cpu, tinykvm::tinykvm_x86regs *regs, uintptr_t comparison) {
+    assert(INSTRUMENT_CMPCOV);
+    csh handle;
+    cs_insn *insn;
+
+    cs_open(CS_ARCH_X86, CS_MODE_64, &handle);
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+
+    uint8_t *code = (uint8_t*)cpu.machine().main_memory().at(comparison, 0x20);
+    assert(cs_disasm(handle, code, 0x20, comparison, 1, &insn) == 1);
+
+    uint64_t op0 = 0;
+    uint64_t op1 = 0;
+    printf("cmpcov %p resolving %x %s\n", comparison, *code, insn->op_str);
+    assert(resolve_operand(cpu.machine().main_memory(), &insn->detail->x86.operands[0], regs, &op0) == 0);
+    assert(resolve_operand(cpu.machine().main_memory(), &insn->detail->x86.operands[1], regs, &op1) == 0);
+    cs_free(insn, 1);
+
+    if(EMIT_COVERAGE) {
+        printf("cmpcov %p -> %p %p\n", comparison, op0, op1);
+    }
+    dictionary.insert(op0);
+    dictionary.insert(op1);
+    cs_close(&handle);
+    return;
 }
 
 static uint64_t coverage_vmexit_count = 0;
@@ -649,7 +743,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         uint8_t *index = (uint8_t*)(host_code + 1);
         // Check if this is the first time a coverage hook was hit, in which case
         // we need to push the coverage frontier forward
-        if((*index & COVERAGE_BITS) == COVERAGE_FRESH) {
+        if((*index & COVERAGE_FRESH) == COVERAGE_FRESH) {
             hit_fresh_branch(cpu, pc, index);
             assert((*index & COVERAGE_FRESH) == 0);
         }
@@ -671,11 +765,19 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
             printf("%x %x\n", pc, rflags);
         }
 
+        // DYNCALL and CMPCOV are disjointa branch types
         if((*index & COVERAGE_BITS) == COVERAGE_DYNCALL) {
             target = hit_dyncall(cpu, pc, trampoline_code, index);
-        } else if((*index & COVERAGE_BITS) == COVERAGE_DYNJUMP) {
-            // TODO: INSTRUMENT_DYNJUMP
-            assert(false);
+        } else if((*index & COVERAGE_CMPCOV) == COVERAGE_CMPCOV) {
+            auto regs = cpu.registers();
+            regs.rdi = host_frame->rdi;
+            regs.rsp = host_frame->stack;
+            regs.rip = pc;
+
+            assert(cmpcov_operand.contains(pc));
+            auto comparison = cmpcov_operand[pc];
+            hit_cmpcov(cpu, &regs, comparison);
+            printf("cmpcov %x, %x\n", pc, comparison);
         }
 
         host_frame->rip = target;
@@ -706,6 +808,13 @@ void coverage_report(tinykvm::Machine& machine) {
     }
     printf("Coverage Count: 0x%x\n", count);
     printf("VMExit Count: 0x%x\n", coverage_vmexit_count);
+    if constexpr(INSTRUMENT_CMPCOV) {
+        printf("Dictionary:");
+        for(auto entry : dictionary) {
+            printf(" %x", entry);
+        }
+        printf("\n");
+    }
 }
 
 
@@ -775,7 +884,7 @@ int main(int argc, char** argv)
         // For NX based basic block discovery, having hugepages means we miss
         // many more other blocks once we trap one page.
         //.split_hugepages = true,
-        .split_all_hugepages_during_loading = true,
+        //.split_all_hugepages_during_loading = true,
 
         .relocate_fixed_mmap = (getenv("GO") == nullptr),
         .executable_heap = dyn_elf.is_dynamic,

@@ -41,6 +41,11 @@ extern "C" [[gnu::no_caller_saved_registers]] void _guest_bp_handler(struct stac
         return;
     }
 
+    if((*index & COVERAGE_CMPCOV) == COVERAGE_CMPCOV) {
+        // VMM has to emulate cmpcov operand
+        return;
+    }
+
     uint8_t page_index = *index & ~COVERAGE_BITS;
     uintptr_t inst_disp = pc % TRAMPOLINE_SIZE;
     auto page = vm64_coverage_state->trampolines[page_index];
