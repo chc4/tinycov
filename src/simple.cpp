@@ -27,9 +27,9 @@
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
 #define INSTRUMENT_DYNJUMP 0
 #define INSTRUMENT_DYNCALL 1
-#define ENTRY_TRACING 0
+#define ENTRY_TRACING 1
 #define UNEXEC_TRACING 1
-//#define EMIT_COVERAGE 1
+#define EMIT_COVERAGE 0
 //#define DEBUG 1
 
 #ifdef DEBUG
@@ -545,9 +545,9 @@ static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, ui
     assert(resolve_target(cpu.machine().main_memory(), insn, &regs, &target) == 0);
     cs_free(insn, 1);
 
-#ifdef EMIT_COVERAGE
-    printf("dyncall %p -> %p\n", pc, target);
-#endif
+    if(EMIT_COVERAGE) {
+        printf("dyncall %p -> %p\n", pc, target);
+    }
     cs_close(&handle);
     hook_block(cpu, target);
     return target;
@@ -667,9 +667,9 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         dprintf("pc=%p inst=%x\n", pc, trampoline_code_bytes);
         uint32_t target = page.guest_addr + inst_disp;
 
-#ifdef EMIT_COVERAGE
-        printf("%x %x\n", pc, rflags);
-#endif
+        if(EMIT_COVERAGE) {
+            printf("%x %x\n", pc, rflags);
+        }
 
         if((*index & COVERAGE_BITS) == COVERAGE_DYNCALL) {
             target = hit_dyncall(cpu, pc, trampoline_code, index);

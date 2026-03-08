@@ -72,3 +72,9 @@ hot loops aren't great
 * tinycov: 3.29s
 
 Trying to compile real programs fails because clang++ uses `/proc/self/fd` to read files, which breaks with the VMM FD translation :[
+
+And, just for fun, switching the `INT 3` handler to be a ring 3 -> ring 0 interrupt instead gives:
+
+* tinycov kernel: 81.2s
+
+for the `bzip2` case, which is 57% (!) slower.
