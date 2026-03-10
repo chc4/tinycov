@@ -30,7 +30,7 @@
 #define INSTRUMENT_CMPCOV 1
 #define ENTRY_TRACING 1
 #define UNEXEC_TRACING 1
-#define EMIT_COVERAGE 0
+#define EMIT_COVERAGE 1
 //#define DEBUG 1
 
 #ifdef DEBUG
@@ -232,7 +232,7 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst, cmpcov_
     *(host_code + 1) = page->index | COVERAGE_FRESH;
 
     if(cmpcov->present && cmpcov->has_reg) {
-        printf("collecting cmpcov operand for %x\n", pc);
+        dprintf("collecting cmpcov operand for %x\n", pc);
         cmpcov_operand[pc] = cmpcov->cmp;
         *(host_code + 1) = *(host_code + 1) | COVERAGE_CMPCOV;
     }
@@ -374,7 +374,7 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
 
                         if(i->detail->x86.operands[1].type == X86_OP_IMM) {
                             auto magic = i->detail->x86.operands[1].imm;
-                            printf("cmpcov static magic: %x\n", magic);
+                            dprintf("cmpcov static magic: %x\n", magic);
                             dictionary.insert(i->detail->x86.operands[1].imm);
                         } else if(i->detail->x86.operands[1].size == 4 || i->detail->x86.operands[1].size == 8) {
                             // <16bit operands are small enough that a fuzzer will
@@ -563,7 +563,7 @@ int resolve_operand(tinykvm::vMemory& memory, cs_x86_op *op, tinykvm::tinykvm_x8
                 addr += get_register_value(regs, op->mem.index) * op->mem.scale;
 
             // Now read from memory at 'addr'
-            *target = *(uint64_t*)memory.at(addr);  // or your memory reader
+            memcpy(target, memory.safely_at(addr, sizeof(*target)), sizeof(*target));
             return 0;
         }
     }
@@ -633,13 +633,13 @@ static void hit_cmpcov(tinykvm::vCPU& cpu, tinykvm::tinykvm_x86regs *regs, uintp
 
     uint64_t op0 = 0;
     uint64_t op1 = 0;
-    printf("cmpcov %p resolving %x %s\n", comparison, *code, insn->op_str);
+    dprintf("cmpcov %p resolving %x %s\n", comparison, *code, insn->op_str);
     assert(resolve_operand(cpu.machine().main_memory(), &insn->detail->x86.operands[0], regs, &op0) == 0);
     assert(resolve_operand(cpu.machine().main_memory(), &insn->detail->x86.operands[1], regs, &op1) == 0);
     cs_free(insn, 1);
 
     if(EMIT_COVERAGE) {
-        printf("cmpcov %p -> %p %p\n", comparison, op0, op1);
+        printf("cmpcov %p -> %llx %llx\n", comparison, op0, op1);
     }
     dictionary.insert(op0);
     dictionary.insert(op1);
@@ -777,7 +777,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
             assert(cmpcov_operand.contains(pc));
             auto comparison = cmpcov_operand[pc];
             hit_cmpcov(cpu, &regs, comparison);
-            printf("cmpcov %x, %x\n", pc, comparison);
+            dprintf("cmpcov %x, %x\n", pc, comparison);
         }
 
         host_frame->rip = target;
@@ -811,7 +811,7 @@ void coverage_report(tinykvm::Machine& machine) {
     if constexpr(INSTRUMENT_CMPCOV) {
         printf("Dictionary:");
         for(auto entry : dictionary) {
-            printf(" %x", entry);
+            printf(" %lx", entry);
         }
         printf("\n");
     }
@@ -883,8 +883,8 @@ int main(int argc, char** argv)
 
         // For NX based basic block discovery, having hugepages means we miss
         // many more other blocks once we trap one page.
-        //.split_hugepages = true,
-        //.split_all_hugepages_during_loading = true,
+        .split_hugepages = true,
+        .split_all_hugepages_during_loading = true,
 
         .relocate_fixed_mmap = (getenv("GO") == nullptr),
         .executable_heap = dyn_elf.is_dynamic,
