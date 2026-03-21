@@ -35,19 +35,21 @@ extern "C" [[gnu::no_caller_saved_registers]] void _guest_bp_handler(struct stac
     vm64_coverage_state->coverage_map[idx >> CHAR_BIT] |= 1<<(idx & (CHAR_BIT-1));
 
     uint8_t *index = (uint8_t*)(pc + 1);
-    if((*index & COVERAGE_BITS) == COVERAGE_FRESH) {
+    if((*index & (uint8_t)COVERAGE_BITS) == COVERAGE_FRESH) {
         // VMM has to hook
         //frame->rdi = 0xf0f0f011;
         return;
     }
 
+#ifdef COVERAGE_CMPCOV
     if((*index & COVERAGE_CMPCOV) == COVERAGE_CMPCOV) {
         // VMM has to emulate cmpcov operand
         return;
     }
+#endif
 
-    uint8_t page_index = *index & ~COVERAGE_BITS;
-    uintptr_t inst_disp = pc % TRAMPOLINE_SIZE;
+    uint8_t page_index = *index & (uint8_t)~COVERAGE_BITS;
+    uintptr_t inst_disp = pc % TRAMPOLINE_USABLE;
     auto page = vm64_coverage_state->trampolines[page_index];
     if(page == 0) {
         // VMM has to allocate trampoline page
@@ -56,7 +58,7 @@ extern "C" [[gnu::no_caller_saved_registers]] void _guest_bp_handler(struct stac
     size_t trampoline_code = (size_t)(page + inst_disp);
     size_t target = trampoline_code;
 
-    if((*index & COVERAGE_BITS) == COVERAGE_DYNCALL) {
+    if((*index & (uint8_t)COVERAGE_BITS) == COVERAGE_DYNCALL) {
         // Have to emulate DYNCALL in the VMM
         // TODO: we can instead JIT the DYNCALL emulation to the trampoline so we
         // don't need to take a VMExit

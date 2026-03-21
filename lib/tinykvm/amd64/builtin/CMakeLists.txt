@@ -20,6 +20,7 @@ add_custom_command(
             -o ${CMAKE_CURRENT_BINARY_DIR}/guest.o
             ${CMAKE_CURRENT_SOURCE_DIR}/guest.cpp
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/guest.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/guest.h
 )
 
 add_custom_command(

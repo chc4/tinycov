@@ -25,12 +25,6 @@
 
 #define GUEST_MEMORY   0x80000000  /* 2GB memory */
 #define GUEST_WORK_MEM 1024UL * 1024*1024 /* MB working mem */
-#define INSTRUMENT_DYNJUMP 0
-#define INSTRUMENT_DYNCALL 1
-#define INSTRUMENT_CMPCOV 1
-#define ENTRY_TRACING 1
-#define UNEXEC_TRACING 1
-#define EMIT_COVERAGE 1
 //#define DEBUG 1
 
 #ifdef DEBUG
@@ -86,15 +80,15 @@ void hexdump(tinykvm::vCPU& cpu, uintptr_t data, uintptr_t len) {
 
 
 struct TrampolinePage *allocate_trampoline(tinykvm::Machine& machine) {
-    uint64_t guest_addr = machine.mmap_allocate(0x1000, 0x7, false);
+    uint64_t guest_addr = machine.mmap_allocate(TRAMPOLINE_SIZE, 0x7, false);
     page_at(machine.main_memory(), guest_addr, [] (uint64_t addr, uint64_t& entry, size_t size) {
         // Make the page executable by the user (There is probably a better way to do this?)
         entry = entry & ~PDE64_NX | PDE64_DIRTY;
     });
 
 
-    uintptr_t host_addr = (uintptr_t)machine.main_memory().at(guest_addr, 0x1000);
-    memset((char*)host_addr, 0, 0x1000);
+    uintptr_t host_addr = (uintptr_t)machine.main_memory().at(guest_addr, TRAMPOLINE_SIZE);
+    memset((char*)host_addr, 0, TRAMPOLINE_SIZE);
     dprintf("allocated new trampoline page @ h:%x g:%x\n", host_addr, guest_addr);
     struct TrampolinePage new_page = {
         .host_addr = host_addr,
@@ -102,7 +96,7 @@ struct TrampolinePage *allocate_trampoline(tinykvm::Machine& machine) {
         .present = {},
         .index = next_index,
     };
-    assert(next_index < 0x40);
+    assert(!(next_index > (uint8_t)~COVERAGE_BITS));
     next_index += 1;
     trampoline.push_back(new_page);
     collect_state->trampolines[new_page.index] = guest_addr;
@@ -160,8 +154,8 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst, cmpcov_
     // Install coverage hook on a branch exit of a basic block
     struct trampoline_branch trampoline_code = {};
     dprintf("hooking @ %x\n", pc);
-    uint16_t inst_disp = pc % TRAMPOLINE_SIZE;
-    size_t start_page = (pc / TRAMPOLINE_SIZE);
+    uint16_t inst_disp = pc % TRAMPOLINE_USABLE;
+    size_t start_page = (pc / TRAMPOLINE_USABLE);
     //assert(start_page == end_page);
     //if(start_page != end_page) {
     //    return;
@@ -231,11 +225,13 @@ static void hook_branch(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst, cmpcov_
     // Replace second byte with page selector, and mark it as fresh
     *(host_code + 1) = page->index | COVERAGE_FRESH;
 
-    if(cmpcov->present && cmpcov->has_reg) {
+#ifdef INSTRUMENT_CMPCOV
+    if(INSTRUMENT_CMPCOV && cmpcov->present && cmpcov->has_reg) {
         dprintf("collecting cmpcov operand for %x\n", pc);
         cmpcov_operand[pc] = cmpcov->cmp;
         *(host_code + 1) = *(host_code + 1) | COVERAGE_CMPCOV;
     }
+#endif
 
     dprintf("marked present %x--%x\n", inst_disp, inst_disp + i);
 }
@@ -257,7 +253,7 @@ static void hook_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, cs_insn *inst) {
     memcpy(trampoline_code, inst->bytes, inst->size);
 
     dprintf("hooking dyncall @ %x: %s %s\n", pc, inst->mnemonic, inst->op_str);
-    uint16_t inst_disp = pc % TRAMPOLINE_SIZE;
+    uint16_t inst_disp = pc % TRAMPOLINE_USABLE;
     //assert(start_page == end_page);
     //if(start_page != end_page) {
     //    return;
@@ -365,6 +361,7 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
                         hit_branch = true;
                         break;
                     }
+#ifdef INSTRUMENT_CMPCOV
                     if(INSTRUMENT_CMPCOV && strcmp(i->mnemonic, "cmp") == 0) {
                         // Record last cmp as the cmpcov state for this block's exit
                         cmpcov = {
@@ -383,6 +380,7 @@ static void hook_block(tinykvm::vCPU& cpu, uintptr_t entry) {
                         }
                         break;
                     }
+#endif
                     cs_detail *detail = i->detail;
                     if (detail->groups_count > 0) {
                         dprintf("\tinstruction group: ");
@@ -448,10 +446,10 @@ cleanup:
 
 static void hit_fresh_branch(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *selector) {
     // We hit the coverage hook of a block exit for the first time
-    uint32_t index = *selector & ~COVERAGE_BITS;
+    uint32_t index = *selector & (uint8_t)~COVERAGE_BITS;
     // Find the two successors of this coverage branch by looking at our own trampoline
     // instructions, which have displacements we can easily read out.
-    uintptr_t inst_disp = pc % TRAMPOLINE_SIZE;
+    uintptr_t inst_disp = pc % TRAMPOLINE_USABLE;
     auto page = trampoline.at(index);
     assert(page.present.contains(inst_disp));
 
@@ -620,6 +618,7 @@ static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, ui
     return target;
 }
 
+#ifdef INSTRUMENT_CMPCOV
 static void hit_cmpcov(tinykvm::vCPU& cpu, tinykvm::tinykvm_x86regs *regs, uintptr_t comparison) {
     assert(INSTRUMENT_CMPCOV);
     csh handle;
@@ -646,6 +645,7 @@ static void hit_cmpcov(tinykvm::vCPU& cpu, tinykvm::tinykvm_x86regs *regs, uintp
     cs_close(&handle);
     return;
 }
+#endif
 
 static uint64_t coverage_vmexit_count = 0;
 
@@ -673,7 +673,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
 
             if(prot & PROT_EXEC) {
                 unexec_pages.add(allocated);
-                for(int i = 0; i < (length-1); i += 0x1000) {
+                for(int i = 0; i < (length-1); i += PAGE_SIZE) {
                     // XXX: DEBUG
                     //if(allocated + i == 0x267be000) { continue; }
                     page_at(cpu.machine().main_memory(), allocated + i,
@@ -681,7 +681,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
                     {
                         entry = entry | PDE64_NX | PDE64_DIRTY;
                     });
-                    (void)*cpu.machine().main_memory().safely_at(allocated + i, 0x1000);
+                    (void)*cpu.machine().main_memory().safely_at(allocated + i, PAGE_SIZE);
                     unexec_pages.add(allocated + i);
                 }
                 dprintf("unexec %p\n", allocated);
@@ -693,7 +693,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
             uint64_t rip;
             // Only handle NX-bit faults
             cpu.machine().unsafe_copy_from_guest(&code, cpu.registers().rsp+16,  8);
-            if(code & 0x10 == 0) { return false; }
+            if((code & 0x10) == 0) { return false; }
             // We need to use the guest RIP, not the fault address, because the instruction
             // may straddle the page boundary.
             cpu.machine().unsafe_copy_from_guest(&rip, cpu.registers().rsp+24,  8);
@@ -748,8 +748,8 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
             assert((*index & COVERAGE_FRESH) == 0);
         }
 
-        uint8_t page_index = *index & ~COVERAGE_BITS;
-        uintptr_t inst_disp = pc % TRAMPOLINE_SIZE;
+        uint8_t page_index = *index & (uint8_t)~COVERAGE_BITS;
+        uintptr_t inst_disp = pc % TRAMPOLINE_USABLE;
         auto page = trampoline.at(page_index);
         assert(page.present.contains(inst_disp));
 
@@ -766,9 +766,11 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         }
 
         // DYNCALL and CMPCOV are disjointa branch types
-        if((*index & COVERAGE_BITS) == COVERAGE_DYNCALL) {
+        if((*index & (uint8_t)COVERAGE_BITS) == COVERAGE_DYNCALL) {
             target = hit_dyncall(cpu, pc, trampoline_code, index);
-        } else if((*index & COVERAGE_CMPCOV) == COVERAGE_CMPCOV) {
+        }
+#ifdef INSTRUMENT_CMPCOV
+        else if((*index & COVERAGE_CMPCOV) == COVERAGE_CMPCOV) {
             auto regs = cpu.registers();
             regs.rdi = host_frame->rdi;
             regs.rsp = host_frame->stack;
@@ -779,6 +781,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
             hit_cmpcov(cpu, &regs, comparison);
             dprintf("cmpcov %x, %x\n", pc, comparison);
         }
+#endif
 
         host_frame->rip = target;
 
@@ -808,6 +811,7 @@ void coverage_report(tinykvm::Machine& machine) {
     }
     printf("Coverage Count: 0x%x\n", count);
     printf("VMExit Count: 0x%x\n", coverage_vmexit_count);
+#ifdef INSTRUMENT_CMPCOV
     if constexpr(INSTRUMENT_CMPCOV) {
         printf("Dictionary:");
         for(auto entry : dictionary) {
@@ -815,6 +819,7 @@ void coverage_report(tinykvm::Machine& machine) {
         }
         printf("\n");
     }
+#endif
 }
 
 
