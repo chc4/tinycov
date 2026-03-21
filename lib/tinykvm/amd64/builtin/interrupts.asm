@@ -40,9 +40,9 @@ dw .vm64_dso
 dd 0x0       ;; Reserved/Padding
 
 ALIGN 0x10
-.kvm_wallclock:   ;; 0x2010
+.kvm_wallclock:   ;; 0x2020
 	resb 0x10     ;; 16b for KVM Wall-clock
-.kvm_system_time: ;; 0x2020
+.kvm_system_time: ;; 0x2030
 	resb 0x20     ;; 32b for KVM System-time
 
 ALIGN 0x10

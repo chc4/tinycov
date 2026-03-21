@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <sys/ioctl.h>
 #include <set>
 #include "assert.hpp"
 #include "load_file.hpp"
@@ -647,6 +648,15 @@ static void hit_cmpcov(tinykvm::vCPU& cpu, tinykvm::tinykvm_x86regs *regs, uintp
 }
 #endif
 
+void drain_coverage_log(tinykvm::Machine& machine) {
+    uint32_t trace_index = (uint32_t)(uintptr_t)collect_state->trace_index;
+    for(int i = 0; i < trace_index; i += sizeof(struct CoverageItem)) {
+        struct CoverageItem item;
+        machine.copy_from_guest(&item, collect_state->trace_log + i,  sizeof(item));
+        printf("%llx drain %x %x\n", item.timestamp, item.rip, item.rflags);
+    }
+}
+
 static uint64_t coverage_vmexit_count = 0;
 
 static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
@@ -724,11 +734,18 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     // Create coverage bitmap
     collect_state->coverage_map = machine.mmap_allocate(COVERAGE_BITMAP_SIZE, 0x7, false);
     dprintf("coverage map @ %x\n", collect_state->coverage_map);
+#ifdef PRECISE_COVERAGE
+    // Create ringbuffer for precise coverage tracing in the guest
+    collect_state->trace_log = machine.mmap_allocate(PRECISE_TRACE_LOG_SIZE, 0x7, false);
+    collect_state->trace_index = 0;
+    dprintf("coverage trace log @ %x\n", collect_state->trace_log);
+#endif
 
     ((tinykvm::iasm_header*)machine.main_memory().at(
         machine.main_memory().physbase + tinykvm::INTR_ASM_ADDR))->vm64_coverage_state = collect_state_guest;
 
     machine.install_output_handler([](tinykvm::vCPU& cpu, unsigned int io_port, unsigned int val) {
+        if(io_port == 0x21) { drain_coverage_log(cpu.machine()); return; }
         if(io_port != 0x20) { return; }
         coverage_vmexit_count += 1;
         auto guest_frame = cpu.registers().rdi;
@@ -802,7 +819,9 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
     return 0;
 }
 
+
 void coverage_report(tinykvm::Machine& machine) {
+    drain_coverage_log(machine);
     hexdump(machine.cpu(), collect_state->coverage_map, COVERAGE_BITMAP_SIZE);
     uint8_t* mem = (uint8_t *)machine.main_memory().at(collect_state->coverage_map, COVERAGE_BITMAP_SIZE);
     uint32_t count = 0;

@@ -193,9 +193,9 @@ void vCPU::init(int id, Machine& machine, const MachineOptions& options)
 	{
 		// KVM PV wall clock and system time
 		msrs.entries[2].index = 0x4b564d00; // MSR_KVM_WALL_CLOCK_NEW
-		msrs.entries[2].data  = 0x2010;
+		msrs.entries[2].data  = 0x2020;
 		msrs.entries[3].index = 0x4b564d01; // MSR_KVM_SYSTEM_TIME_NEW
-		msrs.entries[3].data  = 0x2021;
+		msrs.entries[3].data  = 0x2031;
 		msrs.nmsrs += 2; // Add 2 more MSRs
 	}
 
