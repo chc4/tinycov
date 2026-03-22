@@ -60,6 +60,28 @@ static uint32_t next_index = 0;
 
 static struct CollectorState *collect_state;
 uint64_t collect_state_guest;
+FILE* emit_file;
+
+#ifdef EMIT_COVERAGE
+void emit_coverage(const char *fmt, ...) {
+    va_list ap;
+
+    // If we have precise coverage, then we also want to include the coverage trace entry
+    // that this information is about.
+#ifdef PRECISE_COVERAGE
+    fprintf(emit_file, "%x ", collect_state->trace_index - sizeof(struct CoverageItem));
+#endif
+    va_start(ap, fmt);
+    vfprintf(emit_file, fmt, ap);
+    va_end(ap);
+    return;
+}
+#else
+void emit_coverage(const char *fmt, ...) {
+    // No-op
+    return;
+}
+#endif
 
 void dhexdump(tinykvm::vCPU& cpu, uintptr_t data, uintptr_t len) {
     char* mem = cpu.machine().main_memory().at(data, len);
@@ -612,7 +634,7 @@ static uintptr_t hit_dyncall(tinykvm::vCPU& cpu, uintptr_t pc, uint8_t *code, ui
     cs_free(insn, 1);
 
     if(EMIT_COVERAGE) {
-        printf("dyncall %p -> %p\n", pc, target);
+        emit_coverage("dyncall %p -> %p\n", pc, target);
     }
     cs_close(&handle);
     hook_block(cpu, target);
@@ -639,7 +661,7 @@ static void hit_cmpcov(tinykvm::vCPU& cpu, tinykvm::tinykvm_x86regs *regs, uintp
     cs_free(insn, 1);
 
     if(EMIT_COVERAGE) {
-        printf("cmpcov %p -> %llx %llx\n", comparison, op0, op1);
+        emit_coverage("cmpcov %p %llx %llx\n", comparison, op0, op1);
     }
     dictionary.insert(op0);
     dictionary.insert(op1);
@@ -650,10 +672,13 @@ static void hit_cmpcov(tinykvm::vCPU& cpu, tinykvm::tinykvm_x86regs *regs, uintp
 
 void drain_coverage_log(tinykvm::Machine& machine) {
     uint32_t trace_index = (uint32_t)(uintptr_t)collect_state->trace_index;
+    if(trace_index == 0){
+        return;
+    }
     for(int i = 0; i < trace_index; i += sizeof(struct CoverageItem)) {
         struct CoverageItem item;
         machine.copy_from_guest(&item, collect_state->trace_log + i,  sizeof(item));
-        printf("%llx drain %x %x\n", item.timestamp, item.rip, item.rflags);
+        fprintf(emit_file, "drain %llx %x %x\n", item.timestamp, item.rip, item.rflags);
     }
 }
 
@@ -779,7 +804,7 @@ static uint64_t install_coverage_hooks(tinykvm::Machine& machine) {
         uint32_t target = page.guest_addr + inst_disp;
 
         if(EMIT_COVERAGE) {
-            printf("%x %x\n", pc, rflags);
+            emit_coverage("%x %x\n", pc, rflags);
         }
 
         // DYNCALL and CMPCOV are disjointa branch types
@@ -989,6 +1014,11 @@ int main(int argc, char** argv)
         {"LC_TYPE=C", "LC_ALL=C", "USER=root", "LD_BIND_NOW=1"});
 
     if(getenv("COVERAGE")) {
+        if(getenv("OUTFILE")) {
+            emit_file = fopen(getenv("OUTFILE"), "w");
+        } else {
+            emit_file = stdout;
+        }
         install_coverage_hooks(master_vm);
     }
 
