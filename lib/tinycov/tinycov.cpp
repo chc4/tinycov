@@ -61,6 +61,9 @@ CoverageMachine::~CoverageMachine() {
 
 void CoverageMachine::emit(const char *fmt, ...) {
 #ifdef EMIT_COVERAGE
+    if(!EMIT_COVERAGE) {
+        return;
+    }
     va_list ap;
 
     // If we have precise coverage, then we also want to include the coverage trace entry
@@ -558,7 +561,9 @@ void CoverageMachine::drain_log() {
     for(uint32_t i = 0; i < trace_index; i += sizeof(struct CoverageItem)) {
         struct CoverageItem item;
         m_vm.copy_from_guest(&item, (uintptr_t)m_collect_state->trace_log + i, sizeof(item));
-        fprintf(m_emit_file, "drain %lx %lx %lx\n", (unsigned long)item.timestamp, (unsigned long)item.rip, (unsigned long)item.rflags);
+        if(EMIT_COVERAGE) {
+            fprintf(m_emit_file, "drain %lx %lx %lx\n", (unsigned long)item.timestamp, (unsigned long)item.rip, (unsigned long)item.rflags);
+        }
     }
 }
 
