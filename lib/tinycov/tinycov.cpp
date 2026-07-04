@@ -4,12 +4,40 @@
 #include <tinykvm/amd64/gdt.hpp>
 #include <tinykvm/amd64/idt.hpp>
 #include <tinykvm/amd64/memory_layout.hpp>
+#include <linux/kvm.h>
 #include <cstring>
 #include <stdarg.h>
 #include <sys/mman.h>
 #include <bit>
 
+//#define DEBUG 1
+
+#ifdef DEBUG
+#define dprintf printf
+#else
+#define dprintf(...) ((void)0)
+#endif
+
 namespace tinycov {
+
+void dhexdump(tinykvm::vCPU& cpu, uintptr_t data, uintptr_t len) {
+    char* mem = cpu.machine().main_memory().at(data, len);
+    (void)mem;
+    dprintf("%lx: ", (unsigned long)data);
+    for(size_t i = 0; i < len; i++) {
+        dprintf("%02x ", (unsigned char)mem[i]);
+    }
+    dprintf("\n");
+}
+
+void hexdump(tinykvm::vCPU& cpu, uintptr_t data, uintptr_t len) {
+    char* mem = cpu.machine().main_memory().at(data, len);
+    printf("%lx: ", (unsigned long)data);
+    for(size_t i = 0; i < len; i++) {
+        printf("%02x ", (unsigned char)mem[i]);
+    }
+    printf("\n");
+}
 
 CoverageMachine::CoverageMachine(tinykvm::Machine& vm) : m_vm(vm) {
     if (cs_open(CS_ARCH_X86, CS_MODE_64, &m_capstone_handle) != CS_ERR_OK) {
@@ -57,6 +85,7 @@ TrampolinePage* CoverageMachine::allocate_trampoline() {
 
     uintptr_t host_addr = (uintptr_t)m_vm.main_memory().at(guest_addr, TRAMPOLINE_SIZE);
     memset((char*)host_addr, 0, TRAMPOLINE_SIZE);
+    dprintf("allocated new trampoline page @ h:%lx g:%lx\n", (unsigned long)host_addr, (unsigned long)guest_addr);
 
     TrampolinePage new_page = {
         .host_addr = host_addr,
@@ -77,6 +106,8 @@ TrampolinePage* CoverageMachine::find_trampoline(uint16_t disp, uint16_t len) {
         bool overlap = false;
         for(int i = 0; i < len && !overlap; i++) {
             if(candidate.present.contains((uint16_t)(disp + i))) {
+                dprintf("h:%lx present %x\n", (unsigned long)candidate.host_addr, disp + i);
+                // Something already present in this page
                 overlap = true;
                 break;
             }
@@ -96,6 +127,7 @@ void CoverageMachine::hook_branch(uintptr_t pc, cs_insn *inst, cmpcov_state *cmp
     cmpcov->exit = pc;
     // Install coverage hook on a branch exit of a basic block
     struct trampoline_branch trampoline_code = {};
+    dprintf("hooking @ %lx\n", (unsigned long)pc);
     uint16_t inst_disp = pc % TRAMPOLINE_USABLE;
 
     // Get the condition code from the original instruction
@@ -142,6 +174,9 @@ void CoverageMachine::hook_branch(uintptr_t pc, cs_insn *inst, cmpcov_state *cmp
     trampoline_code.jcc_taken = 0xE9;  // jmp rel32
     trampoline_code.disp_taken = (int32_t)taken_offset;
 
+    dprintf("hook coverage @ %p -> %p, %p\n", (void*)pc, (void*)target_fallthrough, (void*)target_taken);
+
+
     char* host_code = m_vm.main_memory().at(pc, 0x20);
     for(size_t i = 0; i < sizeof(trampoline_code); i++) {
         // Mark the bytes we will use as present
@@ -149,7 +184,7 @@ void CoverageMachine::hook_branch(uintptr_t pc, cs_insn *inst, cmpcov_state *cmp
         // Write the trampoline
         *((char*)page->host_addr + inst_disp + i) = ((char*)&trampoline_code)[i];
     }
-    for(int i = 0; i < inst->size; i++) {
+    for(int i = 0; i < (int)inst->size; i++) {
         // NOP out the actual branch
         *(host_code + i) = 0x90;
     }
@@ -159,11 +194,16 @@ void CoverageMachine::hook_branch(uintptr_t pc, cs_insn *inst, cmpcov_state *cmp
     *(host_code + 1) = page->index | COVERAGE_FRESH;
 
 #ifdef INSTRUMENT_CMPCOV
-    if(INSTRUMENT_CMPCOV && cmpcov->present && cmpcov->has_reg) {
-        m_cmpcov_operand[pc] = cmpcov->cmp;
-        *(host_code + 1) = *(host_code + 1) | COVERAGE_CMPCOV;
+    if constexpr (INSTRUMENT_CMPCOV) {
+        if(cmpcov->present && cmpcov->has_reg) {
+            dprintf("collecting cmpcov operand for %lx\n", (unsigned long)pc);
+            m_cmpcov_operand[pc] = cmpcov->cmp;
+            *(host_code + 1) = *(host_code + 1) | COVERAGE_CMPCOV;
+        }
     }
 #endif
+
+    dprintf("marked present %x--%x\n", inst_disp, inst_disp + (uint32_t)sizeof(trampoline_code));
 }
 
 void CoverageMachine::hook_dyncall(uintptr_t pc, cs_insn *inst) {
@@ -182,16 +222,18 @@ void CoverageMachine::hook_dyncall(uintptr_t pc, cs_insn *inst) {
     uint8_t trampoline_code[inst->size];
     memcpy(trampoline_code, inst->bytes, inst->size);
 
+    dprintf("hooking dyncall @ %lx: %s %s\n", (unsigned long)pc, inst->mnemonic, inst->op_str);
     uint16_t inst_disp = pc % TRAMPOLINE_USABLE;
 
     if(std::string(inst->op_str).find("rip") != std::string::npos) {
+        dprintf("rip-relative dyncall, bailing");
         return;
     }
 
-    TrampolinePage *page = find_trampoline(inst_disp, sizeof(trampoline_code));
+    TrampolinePage *page = find_trampoline(inst_disp, (uint16_t)sizeof(trampoline_code));
 
     bool hit = false;
-    for(int i = 0; i < inst->size; i++) {
+    for(int i = 0; i < (int)inst->size; i++) {
         // Look for the 0xFF opcode byte, which is after any prefix bytes.
         if(trampoline_code[i] != 0xFF) { continue; }
         uint8_t modrm = trampoline_code[i + 1];
@@ -211,7 +253,7 @@ void CoverageMachine::hook_dyncall(uintptr_t pc, cs_insn *inst) {
         // Write the trampoline
         *((char*)page->host_addr + inst_disp + i) = trampoline_code[i];
     }
-    for(int i = 0; i < inst->size; i++) {
+    for(int i = 0; i < (int)inst->size; i++) {
         // NOP out the actual branch
         *(host_code + i) = 0x90;
     }
@@ -219,6 +261,7 @@ void CoverageMachine::hook_dyncall(uintptr_t pc, cs_insn *inst) {
     *(host_code + 0) = 0xcc;
     // Replace second byte with page selector, and mark it as fresh and a dynamic dispatch
     *(host_code + 1) = page->index | COVERAGE_DYNCALL;
+    dprintf("marked present %x--%x\n", inst_disp, inst_disp + (uint32_t)sizeof(trampoline_code));
 }
 
 void CoverageMachine::hook_block(uintptr_t entry) {
@@ -245,6 +288,7 @@ void CoverageMachine::hook_block(uintptr_t entry) {
     while(m_blocks.size() > 0) {
         uintptr_t current_entry = m_blocks.back();
         m_blocks.pop_back();
+        dprintf("-- BLOCK %lx\n", (unsigned long)current_entry);
 
         char *prog_mem = m_vm.main_memory().at(current_entry, 0x2000);
         size_t off = 0;
@@ -253,40 +297,50 @@ void CoverageMachine::hook_block(uintptr_t entry) {
             // disassemble one inst at a time until we hit the end of the basic block
             count = cs_disasm(m_capstone_handle, (const uint8_t*)(prog_mem + off), 0x1000, (uint64_t)(current_entry + off), 1, &insn);
             if (count > 0) {
+                assert(count == 1);
                 for (size_t j = 0; j < count && !hit_branch; j++) {
                     cs_insn *i = &(insn[j]);
                     if(strcmp(i->mnemonic, "int3") == 0) {
                         // One of our breakpoints, which we know was previously
                         // a basic block exit.
+                        dprintf("0x%" PRIx64 ":\t%s\n", i->address, "COV");
                         hit_branch = true;
                         break;
                     }
                     off += i->size;
+                    dprintf("0x%" PRIx64 ":\t%s\t\t%s\n", i->address, i->mnemonic,
+                            i->op_str);
                     if(strcmp(i->mnemonic, "ret") == 0) {
                         // End of basic block
                         hit_branch = true;
                         break;
                     }
 #ifdef INSTRUMENT_CMPCOV
-                    if(INSTRUMENT_CMPCOV && strcmp(i->mnemonic, "cmp") == 0) {
-                        // Record last cmp as the cmpcov state for this block's exit
-                        cmpcov = {
-                            .present = true,
-                            .exit = 0,
-                            .cmp = i->address,
-                        };
-                        if(i->detail->x86.operands[1].type == X86_OP_IMM) {
-                            m_dictionary.insert(i->detail->x86.operands[1].imm);
-                        } else if(i->detail->x86.operands[1].size == 4 || i->detail->x86.operands[1].size == 8) {
-                            // <16bit operands are small enough that a fuzzer will
-                            // find them just by guessing fast enough to not matter.
-                            cmpcov.has_reg = true;
+                    if constexpr (INSTRUMENT_CMPCOV) {
+                        if(strcmp(i->mnemonic, "cmp") == 0) {
+                            // Record last cmp as the cmpcov state for this block's exit
+                            cmpcov = {
+                                .present = true,
+                                .exit = 0,
+                                .cmp = i->address,
+                            };
+                            if(i->detail->x86.operands[1].type == X86_OP_IMM) {
+                                auto magic = i->detail->x86.operands[1].imm;
+                                dprintf("cmpcov static magic: %lx\n", (unsigned long)magic);
+                                m_dictionary.insert(i->detail->x86.operands[1].imm);
+                            } else if(i->detail->x86.operands[1].size == 4 || i->detail->x86.operands[1].size == 8) {
+                                // <16bit operands are small enough that a fuzzer will
+                                // find them just by guessing fast enough to not matter.
+                                cmpcov.has_reg = true;
+                            }
                         }
                     }
 #endif
                     cs_detail *detail = i->detail;
                     if (detail->groups_count > 0) {
+                        dprintf("\tinstruction group: ");
                         for (int n = 0; n < detail->groups_count; n++) {
+                            dprintf("%s ", cs_group_name(m_capstone_handle, detail->groups[n]));
                             if(detail->groups[n] == CS_GRP_CALL) {
                                 if(i->detail->x86.operands[0].type == X86_OP_IMM) {
                                     // Follow the branch
@@ -302,6 +356,7 @@ void CoverageMachine::hook_block(uintptr_t entry) {
                             if(detail->groups[n] == CS_GRP_JUMP) {
                                 if(i->detail->x86.operands[0].type == X86_OP_IMM) {
                                     auto dest = i->detail->x86.operands[0].imm;
+                                    dprintf(" x86_jmp! %lx\n", (unsigned long)dest);
                                     if(strcmp(i->mnemonic, "jmp") == 0) {
                                         // Just follow unconditional branch
                                         add_exit(dest);
@@ -318,10 +373,12 @@ void CoverageMachine::hook_block(uintptr_t entry) {
                                 }
                             }
                         }
+                        dprintf("\n");
                     }
                 }
                 cs_free(insn, count);
             } else {
+                dprintf("ERROR: Failed to disassemble given code! final off: %lx (%ld)\n", (unsigned long)off, (long)off);
                 break;
             }
             if(hit_branch) {
@@ -348,6 +405,7 @@ void CoverageMachine::hit_fresh_branch(uintptr_t pc, uint8_t *selector) {
 
     uint32_t target_fallthrough = page.guest_addr + inst_disp + 7 + fallthrough_offset;
     uint32_t target_taken = page.guest_addr + inst_disp + 12 + taken_offset;
+    dprintf("fresh coverage @ %p -> %p, %p\n", (void*)pc, (void*)target_fallthrough, (void*)target_taken);
 
     *selector = *selector & ~COVERAGE_FRESH;
 
@@ -398,7 +456,7 @@ uint64_t CoverageMachine::get_register_value(const tinykvm::tinykvm_x86regs *reg
         case X86_REG_BH: return regs->rbx & 0xFFFF0000;
         case X86_REG_CH: return regs->rcx & 0xFFFF0000;
         case X86_REG_DH: return regs->rdx & 0xFFFF0000;
-        default: return 0;
+        default: assert(false); return 0;
     }
 }
 
@@ -416,26 +474,32 @@ int CoverageMachine::resolve_operand(cs_x86_op *op, tinykvm::tinykvm_x86regs *re
                 addr += get_register_value(regs, op->mem.base);
             if (op->mem.index != X86_REG_INVALID)
                 addr += get_register_value(regs, op->mem.index) * op->mem.scale;
+            // Now read from memory at 'addr'
             memcpy(target, m_vm.main_memory().safely_at(addr, sizeof(*target)), sizeof(*target));
             return 0;
         }
         default: break;
     }
+    assert(false);
     return -1;
 }
 
 int CoverageMachine::resolve_target(cs_insn *insn, tinykvm::tinykvm_x86regs *regs, uint64_t *target) {
     cs_x86_op *op = &insn->detail->x86.operands[0];
+    dprintf("resolving dynamic target %s\n", insn->op_str);
     return resolve_operand(op, regs, target);
 }
 
 uintptr_t CoverageMachine::hit_dyncall(uintptr_t pc, uint8_t *code, uint8_t *selector) {
     (void)selector;
+    assert(INSTRUMENT_DYNCALL);
     auto guest_frame = m_vm.registers().rdi;
     auto host_frame = (struct stack_frame*)m_vm.main_memory().at(guest_frame, sizeof(struct stack_frame));
     // guest_rsp is the guest *kernel* stack. we need to get the guest user rsp
     // from the pushed exception.
     auto guest_user_rsp = host_frame->stack;
+    dprintf("guest_user_rsp %p\n", (void*)guest_user_rsp);
+    dhexdump(m_vm.cpu(), guest_user_rsp, 0x20);
     // Push to the user stack
     guest_user_rsp = guest_user_rsp - sizeof(uintptr_t);
     auto host_ret = (uint64_t*)m_vm.main_memory().at(guest_user_rsp, sizeof(uintptr_t));
@@ -457,25 +521,34 @@ uintptr_t CoverageMachine::hit_dyncall(uintptr_t pc, uint8_t *code, uint8_t *sel
     assert(resolve_target(insn, &regs, &target) == 0);
     cs_free(insn, 1);
 
-    emit("dyncall %p -> %p\n", (void*)pc, (void*)target);
+    if(EMIT_COVERAGE) {
+        emit("dyncall %p -> %p\n", (void*)pc, (void*)target);
+    }
     hook_block(target);
     return target;
 }
 
 void CoverageMachine::hit_cmpcov(tinykvm::tinykvm_x86regs *regs, uintptr_t comparison) {
-    cs_insn *insn;
-    uint8_t *code = (uint8_t*)m_vm.main_memory().at(comparison, 0x20);
-    assert(cs_disasm(m_capstone_handle, code, 0x20, comparison, 1, &insn) == 1);
+#ifdef INSTRUMENT_CMPCOV
+    if constexpr (INSTRUMENT_CMPCOV) {
+        cs_insn *insn;
+        uint8_t *code = (uint8_t*)m_vm.main_memory().at(comparison, 0x20);
+        assert(cs_disasm(m_capstone_handle, code, 0x20, comparison, 1, &insn) == 1);
 
-    uint64_t op0 = 0;
-    uint64_t op1 = 0;
-    assert(resolve_operand(&insn->detail->x86.operands[0], regs, &op0) == 0);
-    assert(resolve_operand(&insn->detail->x86.operands[1], regs, &op1) == 0);
-    cs_free(insn, 1);
+        uint64_t op0 = 0;
+        uint64_t op1 = 0;
+        dprintf("cmpcov %lx resolving %x %s\n", (unsigned long)comparison, *code, insn->op_str);
+        assert(resolve_operand(&insn->detail->x86.operands[0], regs, &op0) == 0);
+        assert(resolve_operand(&insn->detail->x86.operands[1], regs, &op1) == 0);
+        cs_free(insn, 1);
 
-    emit("cmpcov %p %llx %llx\n", (void*)comparison, op0, op1);
-    m_dictionary.insert(op0);
-    m_dictionary.insert(op1);
+        if(EMIT_COVERAGE) {
+            emit("cmpcov %p %llx %llx\n", (void*)comparison, op0, op1);
+        }
+        m_dictionary.insert(op0);
+        m_dictionary.insert(op1);
+    }
+#endif
 }
 
 void CoverageMachine::drain_log() {
@@ -495,9 +568,11 @@ void CoverageMachine::on_output(tinykvm::vCPU& cpu, unsigned int io_port, unsign
     m_coverage_vmexit_count += 1;
     auto guest_frame = cpu.registers().rdi;
     auto host_frame = (struct stack_frame*)cpu.machine().main_memory().at(guest_frame, sizeof(struct stack_frame));
+    dprintf("rdi=%lx rip=%lx cs=%lx rflags=%lx stack=%lx\n", (unsigned long)host_frame->rdi, (unsigned long)host_frame->rip, (unsigned long)host_frame->cs, (unsigned long)host_frame->rflags, (unsigned long)host_frame->stack);
     uint64_t rflags = host_frame->rflags;
     size_t pc = host_frame->rip - 1;
     auto host_code = (char*)cpu.machine().main_memory().at(pc, 0x10);
+    dprintf("custom io handler, val=%lx\n", (unsigned long)host_frame->rip);
 
     // Load trampoline page index
     uint8_t *index = (uint8_t*)(host_code + 1);
@@ -505,31 +580,43 @@ void CoverageMachine::on_output(tinykvm::vCPU& cpu, unsigned int io_port, unsign
     // we need to push the coverage frontier forward
     if((*index & COVERAGE_FRESH) == COVERAGE_FRESH) {
         hit_fresh_branch(pc, index);
+        assert((*index & COVERAGE_FRESH) == 0);
     }
 
     uint8_t page_index = *index & (uint8_t)~COVERAGE_BITS;
     uintptr_t inst_disp = pc % TRAMPOLINE_USABLE;
     auto page = m_trampoline.at(page_index);
+    assert(page.present.contains(inst_disp));
+
+    dprintf("trampoline h:%lx g:%lx contains\n", (unsigned long)page.host_addr, (unsigned long)page.guest_addr);
 
     uint8_t *trampoline_code = (uint8_t*)(page.host_addr + inst_disp);
+    uint32_t trampoline_code_bytes = 0;
+    memcpy(&trampoline_code_bytes, trampoline_code, sizeof(trampoline_code_bytes));
+    dprintf("pc=%p inst=%x\n", (void*)pc, trampoline_code_bytes);
     uint32_t target = page.guest_addr + inst_disp;
 
-    emit("%lx %lx\n", (unsigned long)pc, (unsigned long)rflags);
+    if(EMIT_COVERAGE) {
+        emit("%lx %lx\n", (unsigned long)pc, (unsigned long)rflags);
+    }
 
     // DYNCALL and CMPCOV are disjointa branch types
     if((*index & (uint8_t)COVERAGE_BITS) == COVERAGE_DYNCALL) {
         target = hit_dyncall(pc, trampoline_code, index);
     }
 #ifdef INSTRUMENT_CMPCOV
-    else if((*index & COVERAGE_CMPCOV) == COVERAGE_CMPCOV) {
-        auto regs = cpu.registers();
-        regs.rdi = host_frame->rdi;
-        regs.rsp = host_frame->stack;
-        regs.rip = pc;
+    else if constexpr (INSTRUMENT_CMPCOV) {
+        if((*index & COVERAGE_CMPCOV) == COVERAGE_CMPCOV) {
+            auto regs = cpu.registers();
+            regs.rdi = host_frame->rdi;
+            regs.rsp = host_frame->stack;
+            regs.rip = pc;
 
-        assert(m_cmpcov_operand.contains(pc));
-        auto comparison = m_cmpcov_operand[pc];
-        hit_cmpcov(&regs, comparison);
+            assert(m_cmpcov_operand.contains(pc));
+            auto comparison = m_cmpcov_operand[pc];
+            hit_cmpcov(&regs, comparison);
+            dprintf("cmpcov %lx, %lx\n", (unsigned long)pc, (unsigned long)comparison);
+        }
     }
 #endif
     host_frame->rip = target;
@@ -538,16 +625,22 @@ void CoverageMachine::on_output(tinykvm::vCPU& cpu, unsigned int io_port, unsign
 bool CoverageMachine::on_page_fault(tinykvm::vCPU& cpu, tinykvm::Machine::address_t page) {
     uint64_t code;
     uint64_t rip;
+    // Only handle NX-bit faults
     cpu.machine().unsafe_copy_from_guest(&code, cpu.registers().rsp+16, 8);
     if((code & 0x10) == 0) { return false; }
+    // We need to use the guest RIP, not the fault address, because the instruction
+    // may straddle the page boundary.
     cpu.machine().unsafe_copy_from_guest(&rip, cpu.registers().rsp+24, 8);
+    dprintf("page fault, rip=%lx page=%lx code=%lx\n", (unsigned long)rip, (unsigned long)page, (unsigned long)code);
     bool unexec = false;
     if(m_unexec_pages.contains(page)) {
+        dprintf("unexec pf @ %lx (%lx)\n", (unsigned long)page, (unsigned long)rip);
         m_unexec_pages.remove(page);
         hook_block(rip);
         tinykvm::page_at(cpu.machine().main_memory(), page,
                 [&] (uint64_t, uint64_t& entry, size_t)
         {
+            dprintf("pf entry = %lx\n", (unsigned long)entry);
             entry = (entry & ~PDE64_NX) | PDE64_DIRTY;
             unexec = true;
         }, true);
@@ -559,10 +652,13 @@ void CoverageMachine::on_mmap(tinykvm::vCPU& cpu, tinykvm::Machine::address_t ad
     auto allocated = addr;
     if(allocated == 0) { allocated = cpu.registers().rax; }
     if(allocated == (size_t)MAP_FAILED) { return; }
+    dprintf("mmap callback, %p %lx\n", (void*)allocated, (unsigned long)length);
 
     if(prot & PROT_EXEC) {
         m_unexec_pages.add(allocated);
         for(size_t i = 0; i < (length-1); i += PAGE_SIZE) {
+            // XXX: DEBUG
+            //if(allocated + i == 0x267be000) { continue; }
             tinykvm::page_at(cpu.machine().main_memory(), allocated + i,
                     [] (uint64_t, uint64_t& entry, size_t)
             {
@@ -571,6 +667,7 @@ void CoverageMachine::on_mmap(tinykvm::vCPU& cpu, tinykvm::Machine::address_t ad
             (void)*cpu.machine().main_memory().safely_at(allocated + i, PAGE_SIZE);
             m_unexec_pages.add(allocated + i);
         }
+        dprintf("unexec %p\n", (void*)allocated);
     }
 }
 
@@ -591,9 +688,22 @@ static bool on_page_fault_static(tinykvm::vCPU& cpu, tinykvm::Machine::address_t
 
 void CoverageMachine::install_hooks() {
     uint64_t start_address = m_vm.registers().rip;
+    dprintf("elf start @ %p, %p\n", (void*)start_address, (void*)m_vm.entry_address());
+    char *entry_mem = m_vm.main_memory().at(start_address, sizeof(uint32_t));
+    (void)entry_mem;
+    ////*((uint8_t*)entry_mem + 0) = 0x90;
+    //*((uint8_t*)entry_mem + 1) = 0x90;
+    //*((uint8_t*)entry_mem + 2) = 0x90;
+    dprintf("bytes at start: %s\n", entry_mem);
+
+    print_gdt_entries(m_vm.main_memory().at(m_vm.get_special_registers().gdt.base), 7);
+    m_vm.print_exception_handlers();
+
     m_vm.set_userdata(this);
 
     if(UNEXEC_TRACING) {
+        // Force mmap to not allocate executable memory, so that we always catch the first
+        // jumps to code pages at least
         m_vm.set_mmap_callback([this] (tinykvm::vCPU& cpu, tinykvm::Machine::address_t addr, size_t length, int flags, int prot, int fd, tinykvm::Machine::address_t voff) {
             this->on_mmap(cpu, addr, length, flags, prot, fd, voff);
         });
@@ -603,13 +713,16 @@ void CoverageMachine::install_hooks() {
 
     m_collect_state_guest = m_vm.mmap_allocate(0x1000, 0x7, false);
     m_collect_state = (struct CollectorState *)m_vm.main_memory().at(m_collect_state_guest, sizeof(*m_collect_state));
+    dprintf("collector state @ g=%p s=%p\n", (void*)m_collect_state_guest, m_collect_state);
 
     // Create coverage bitmap
     m_collect_state->coverage_map = (uintptr_t)m_vm.mmap_allocate(COVERAGE_BITMAP_SIZE, 0x7, false);
+    dprintf("coverage map @ %lx\n", (unsigned long)(uintptr_t)m_collect_state->coverage_map);
 #ifdef PRECISE_COVERAGE
     // Create ringbuffer for precise coverage tracing in the guest
     m_collect_state->trace_log = (uintptr_t)m_vm.mmap_allocate(PRECISE_TRACE_LOG_SIZE, 0x7, false);
     m_collect_state->trace_index = 0;
+    dprintf("coverage trace log @ %lx\n", (unsigned long)(uintptr_t)m_collect_state->trace_log);
 #endif
 
     ((tinykvm::iasm_header*)m_vm.main_memory().at(
@@ -631,6 +744,7 @@ void CoverageMachine::install_hooks() {
 
 void CoverageMachine::report() {
     drain_log();
+    hexdump(m_vm.cpu(), (uintptr_t)m_collect_state->coverage_map, COVERAGE_BITMAP_SIZE);
     uint8_t* mem = (uint8_t *)m_vm.main_memory().at((uintptr_t)m_collect_state->coverage_map, COVERAGE_BITMAP_SIZE);
     uint32_t count = 0;
     for(int i = 0; i < COVERAGE_BITMAP_SIZE; i++) {
