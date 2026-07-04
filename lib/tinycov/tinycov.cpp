@@ -747,12 +747,19 @@ void CoverageMachine::install_hooks() {
     }
 }
 
+uint8_t* CoverageMachine::coverage_map(size_t& len) const {
+    uint8_t* mem = (uint8_t *)m_vm.main_memory().at((uintptr_t)m_collect_state->coverage_map, COVERAGE_BITMAP_SIZE);
+    len = COVERAGE_BITMAP_SIZE;
+    return mem;
+}
+
 void CoverageMachine::report() {
     drain_log();
     hexdump(m_vm.cpu(), (uintptr_t)m_collect_state->coverage_map, COVERAGE_BITMAP_SIZE);
-    uint8_t* mem = (uint8_t *)m_vm.main_memory().at((uintptr_t)m_collect_state->coverage_map, COVERAGE_BITMAP_SIZE);
+    size_t len;
+    uint8_t* mem = coverage_map(len);
     uint32_t count = 0;
-    for(int i = 0; i < COVERAGE_BITMAP_SIZE; i++) {
+    for(int i = 0; i < len; i++) {
         count += std::popcount(mem[i]);
     }
     printf("Coverage Count: 0x%x\n", count);
@@ -769,9 +776,10 @@ void CoverageMachine::report() {
 }
 
 uint32_t CoverageMachine::coverage_count() const {
-    uint8_t* mem = (uint8_t *)m_vm.main_memory().at((uintptr_t)m_collect_state->coverage_map, COVERAGE_BITMAP_SIZE);
+    size_t len;
+    uint8_t* mem = coverage_map(len);
     uint32_t count = 0;
-    for(int i = 0; i < COVERAGE_BITMAP_SIZE; i++) {
+    for(int i = 0; i < len; i++) {
         count += std::popcount(mem[i]);
     }
     return count;

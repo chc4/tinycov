@@ -51,6 +51,7 @@ public:
     tinykvm::Machine& machine() { return m_vm; }
 
     // Coverage data accessors
+    uint8_t* coverage_map(size_t&) const;
     uint32_t coverage_count() const;
     const roaring::Roaring& seen_blocks() const { return m_seen; }
     const std::set<uint64_t>& dictionary() const { return m_dictionary; }
