@@ -92,7 +92,20 @@ public:
 
 private:
     // Helpers
+    /**
+     * Get register value from state
+     */
     static uint64_t get_register_value(const tinykvm::tinykvm_x86regs *regs, x86_reg reg);
+    /**
+     * Calculate the concrete jump/call target given instruction and register state.
+     *
+     * @param insn Capstone instruction (must be call or jmp)
+     * @param regs Register state
+     * @param target Output: calculated target address
+     * @param read_memory Callback to read memory (can be NULL if not needed)
+     * @param user_data Passed to read_memory callback
+     * @return 0 on success, -1 on error
+     */
     int resolve_operand(cs_x86_op *op, tinykvm::tinykvm_x86regs *regs, uint64_t *target);
     int resolve_target(cs_insn *insn, tinykvm::tinykvm_x86regs *regs, uint64_t *target);
 };

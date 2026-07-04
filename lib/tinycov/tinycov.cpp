@@ -34,6 +34,9 @@ CoverageMachine::~CoverageMachine() {
 void CoverageMachine::emit(const char *fmt, ...) {
 #ifdef EMIT_COVERAGE
     va_list ap;
+
+    // If we have precise coverage, then we also want to include the coverage trace entry
+    // that this information is about.
 #ifdef PRECISE_COVERAGE
     fprintf(m_emit_file, "%x ", (unsigned int)(m_collect_state->trace_index - sizeof(struct CoverageItem)));
 #endif
@@ -48,6 +51,7 @@ void CoverageMachine::emit(const char *fmt, ...) {
 TrampolinePage* CoverageMachine::allocate_trampoline() {
     uint64_t guest_addr = m_vm.mmap_allocate(TRAMPOLINE_SIZE, 0x7, false);
     tinykvm::page_at(m_vm.main_memory(), guest_addr, [] (uint64_t, uint64_t& entry, size_t) {
+        // Make the page executable by the user (There is probably a better way to do this?)
         entry = (entry & ~PDE64_NX) | PDE64_DIRTY;
     });
 
@@ -82,6 +86,7 @@ TrampolinePage* CoverageMachine::find_trampoline(uint16_t disp, uint16_t len) {
         break;
     }
     if(!page) {
+        // We fellthough without finding a free trampoline slot
         page = allocate_trampoline();
     }
     return page;
@@ -89,9 +94,11 @@ TrampolinePage* CoverageMachine::find_trampoline(uint16_t disp, uint16_t len) {
 
 void CoverageMachine::hook_branch(uintptr_t pc, cs_insn *inst, cmpcov_state *cmpcov) {
     cmpcov->exit = pc;
+    // Install coverage hook on a branch exit of a basic block
     struct trampoline_branch trampoline_code = {};
     uint16_t inst_disp = pc % TRAMPOLINE_USABLE;
 
+    // Get the condition code from the original instruction
     uint8_t condition_code = 0;
     const char* mnemonic = inst->mnemonic;
     if (strcmp(mnemonic, "je") == 0 || strcmp(mnemonic, "jz") == 0) condition_code = 0x4;
@@ -109,7 +116,9 @@ void CoverageMachine::hook_branch(uintptr_t pc, cs_insn *inst, cmpcov_state *cmp
     else if (strcmp(mnemonic, "jl") == 0 || strcmp(mnemonic, "jnge") == 0) condition_code = 0xC;
     else if (strcmp(mnemonic, "jle") == 0 || strcmp(mnemonic, "jng") == 0) condition_code = 0xE;
     else if (strcmp(mnemonic, "jp") == 0 || strcmp(mnemonic, "jpe") == 0) condition_code = 0xA;
+    // TODO: handle this properly
     else if (strcmp(mnemonic, "jrcxz") == 0 || strcmp(mnemonic, "jnrcxz") == 0) return;
+    // lol no
     else if (strcmp(mnemonic, "xbegin") == 0) return;
     else {
         fprintf(stderr, "Unknown branch mnemonic: %s\n", mnemonic);
@@ -118,26 +127,35 @@ void CoverageMachine::hook_branch(uintptr_t pc, cs_insn *inst, cmpcov_state *cmp
 
     TrampolinePage *page = find_trampoline(inst_disp, sizeof(trampoline_code));
 
-    trampoline_code.jcc = 0x70 | condition_code;
-    trampoline_code.disp = 0x05;
+    // We have page and it doesn't have any overlapping data
+    // Write trampoline: jcc +5; jmp fallthrough; jmp target
+    trampoline_code.jcc = 0x70 | condition_code;  // jcc +5
+    trampoline_code.disp = 0x05;                   // offset +5
+    // jmp fallthrough (5 bytes)
     uint64_t target_fallthrough = pc + inst->size;
     int64_t fallthrough_offset = target_fallthrough - (page->guest_addr + inst_disp + 7);
-    trampoline_code.jcc_fallthrough = 0xE9;
+    trampoline_code.jcc_fallthrough = 0xE9;  // jmp rel32
     trampoline_code.disp_fallthrough = (int32_t)fallthrough_offset;
+    // jmp target (5 bytes)
     uint64_t target_taken = inst->detail->x86.operands[0].imm;
     int64_t taken_offset = target_taken - (page->guest_addr + inst_disp + 12);
-    trampoline_code.jcc_taken = 0xE9;
+    trampoline_code.jcc_taken = 0xE9;  // jmp rel32
     trampoline_code.disp_taken = (int32_t)taken_offset;
 
     char* host_code = m_vm.main_memory().at(pc, 0x20);
     for(size_t i = 0; i < sizeof(trampoline_code); i++) {
+        // Mark the bytes we will use as present
         page->present.add(inst_disp + i);
+        // Write the trampoline
         *((char*)page->host_addr + inst_disp + i) = ((char*)&trampoline_code)[i];
     }
     for(int i = 0; i < inst->size; i++) {
+        // NOP out the actual branch
         *(host_code + i) = 0x90;
     }
+    // Replace first NOP with int3
     *(host_code + 0) = 0xcc;
+    // Replace second byte with page selector, and mark it as fresh
     *(host_code + 1) = page->index | COVERAGE_FRESH;
 
 #ifdef INSTRUMENT_CMPCOV
@@ -152,6 +170,15 @@ void CoverageMachine::hook_dyncall(uintptr_t pc, cs_insn *inst) {
     if(!INSTRUMENT_DYNCALL) {
         return;
     }
+    // Install a coverage hook on a dynamic dispatch call exit of a basic block
+    // Unlike branch tracing we can't use trampoline code, because then the
+    // guest will observe the return address being the trampoline code instead
+    // of the correct functions...which will break things such as C++ exception
+    // unwinding.
+    // Instead, we emulate some of the call in the kernel: we push the return address
+    // from the replaced call instruction, and then redirect to the trampoline
+    // which has the same dynamic dispatch but with a jump instead: this means
+    // we don't need to figure out how to emulate the dynamic dispatch in the kernel.
     uint8_t trampoline_code[inst->size];
     memcpy(trampoline_code, inst->bytes, inst->size);
 
@@ -165,8 +192,10 @@ void CoverageMachine::hook_dyncall(uintptr_t pc, cs_insn *inst) {
 
     bool hit = false;
     for(int i = 0; i < inst->size; i++) {
+        // Look for the 0xFF opcode byte, which is after any prefix bytes.
         if(trampoline_code[i] != 0xFF) { continue; }
         uint8_t modrm = trampoline_code[i + 1];
+        // Change the reg field of the ModR/M byte
         uint8_t reg = (modrm >> 3) & 0x07;
         if (reg != 2) continue; // Check it's a call (2)
         trampoline_code[i + 1] = (modrm & 0xC7) | (4 << 3);  // Clear reg field, set to jump (4)
@@ -177,13 +206,18 @@ void CoverageMachine::hook_dyncall(uintptr_t pc, cs_insn *inst) {
 
     char* host_code = m_vm.main_memory().at(pc, 0x20);
     for(size_t i = 0; i < sizeof(trampoline_code); i++) {
+        // Mark the bytes we will use as present
         page->present.add(inst_disp + i);
+        // Write the trampoline
         *((char*)page->host_addr + inst_disp + i) = trampoline_code[i];
     }
     for(int i = 0; i < inst->size; i++) {
+        // NOP out the actual branch
         *(host_code + i) = 0x90;
     }
+    // Replace first NOP with int3
     *(host_code + 0) = 0xcc;
+    // Replace second byte with page selector, and mark it as fresh and a dynamic dispatch
     *(host_code + 1) = page->index | COVERAGE_DYNCALL;
 }
 
@@ -216,21 +250,26 @@ void CoverageMachine::hook_block(uintptr_t entry) {
         size_t off = 0;
         bool hit_branch = false;
         while(off < (0x2000-12) && !hit_branch) {
+            // disassemble one inst at a time until we hit the end of the basic block
             count = cs_disasm(m_capstone_handle, (const uint8_t*)(prog_mem + off), 0x1000, (uint64_t)(current_entry + off), 1, &insn);
             if (count > 0) {
                 for (size_t j = 0; j < count && !hit_branch; j++) {
                     cs_insn *i = &(insn[j]);
                     if(strcmp(i->mnemonic, "int3") == 0) {
+                        // One of our breakpoints, which we know was previously
+                        // a basic block exit.
                         hit_branch = true;
                         break;
                     }
                     off += i->size;
                     if(strcmp(i->mnemonic, "ret") == 0) {
+                        // End of basic block
                         hit_branch = true;
                         break;
                     }
 #ifdef INSTRUMENT_CMPCOV
                     if(INSTRUMENT_CMPCOV && strcmp(i->mnemonic, "cmp") == 0) {
+                        // Record last cmp as the cmpcov state for this block's exit
                         cmpcov = {
                             .present = true,
                             .exit = 0,
@@ -239,6 +278,8 @@ void CoverageMachine::hook_block(uintptr_t entry) {
                         if(i->detail->x86.operands[1].type == X86_OP_IMM) {
                             m_dictionary.insert(i->detail->x86.operands[1].imm);
                         } else if(i->detail->x86.operands[1].size == 4 || i->detail->x86.operands[1].size == 8) {
+                            // <16bit operands are small enough that a fuzzer will
+                            // find them just by guessing fast enough to not matter.
                             cmpcov.has_reg = true;
                         }
                     }
@@ -248,9 +289,11 @@ void CoverageMachine::hook_block(uintptr_t entry) {
                         for (int n = 0; n < detail->groups_count; n++) {
                             if(detail->groups[n] == CS_GRP_CALL) {
                                 if(i->detail->x86.operands[0].type == X86_OP_IMM) {
+                                    // Follow the branch
                                     add_exit(i->detail->x86.operands[0].imm);
                                     break;
                                 } else {
+                                    // Dynamic dispatch: for now just ignore it?
                                     hook_dyncall(i->address, i);
                                     hit_branch = true;
                                     break;
@@ -260,9 +303,11 @@ void CoverageMachine::hook_block(uintptr_t entry) {
                                 if(i->detail->x86.operands[0].type == X86_OP_IMM) {
                                     auto dest = i->detail->x86.operands[0].imm;
                                     if(strcmp(i->mnemonic, "jmp") == 0) {
+                                        // Just follow unconditional branch
                                         add_exit(dest);
                                         break;
                                     } else {
+                                        // Follow both sides of the branch
                                         hook_branch(i->address, i, &cmpcov);
                                         hit_branch = true;
                                         break;
@@ -288,7 +333,10 @@ void CoverageMachine::hook_block(uintptr_t entry) {
 }
 
 void CoverageMachine::hit_fresh_branch(uintptr_t pc, uint8_t *selector) {
+    // We hit the coverage hook of a block exit for the first time
     uint32_t index = *selector & (uint8_t)~COVERAGE_BITS;
+    // Find the two successors of this coverage branch by looking at our own trampoline
+    // instructions, which have displacements we can easily read out.
     uintptr_t inst_disp = pc % TRAMPOLINE_USABLE;
     auto page = m_trampoline.at(index);
     assert(page.present.contains(inst_disp));
@@ -385,12 +433,19 @@ uintptr_t CoverageMachine::hit_dyncall(uintptr_t pc, uint8_t *code, uint8_t *sel
     (void)selector;
     auto guest_frame = m_vm.registers().rdi;
     auto host_frame = (struct stack_frame*)m_vm.main_memory().at(guest_frame, sizeof(struct stack_frame));
+    // guest_rsp is the guest *kernel* stack. we need to get the guest user rsp
+    // from the pushed exception.
     auto guest_user_rsp = host_frame->stack;
+    // Push to the user stack
     guest_user_rsp = guest_user_rsp - sizeof(uintptr_t);
     auto host_ret = (uint64_t*)m_vm.main_memory().at(guest_user_rsp, sizeof(uintptr_t));
     *host_ret = pc + 2;
     host_frame->stack = guest_user_rsp;
 
+    // ugh this doesn't even work well, because we can't resolve the call target to
+    // follow and push the coverage frontier forward, or record in our coverage map...
+    // TODO: jit an assembly stub in the trampoline pages to resolve the dyncall target?
+    // idk what else we can do here unfortunately
     cs_insn *insn;
     assert(cs_disasm(m_capstone_handle, code, 0x20, pc, 1, &insn) == 1);
 
@@ -444,7 +499,10 @@ void CoverageMachine::on_output(tinykvm::vCPU& cpu, unsigned int io_port, unsign
     size_t pc = host_frame->rip - 1;
     auto host_code = (char*)cpu.machine().main_memory().at(pc, 0x10);
 
+    // Load trampoline page index
     uint8_t *index = (uint8_t*)(host_code + 1);
+    // Check if this is the first time a coverage hook was hit, in which case
+    // we need to push the coverage frontier forward
     if((*index & COVERAGE_FRESH) == COVERAGE_FRESH) {
         hit_fresh_branch(pc, index);
     }
@@ -458,6 +516,7 @@ void CoverageMachine::on_output(tinykvm::vCPU& cpu, unsigned int io_port, unsign
 
     emit("%lx %lx\n", (unsigned long)pc, (unsigned long)rflags);
 
+    // DYNCALL and CMPCOV are disjointa branch types
     if((*index & (uint8_t)COVERAGE_BITS) == COVERAGE_DYNCALL) {
         target = hit_dyncall(pc, trampoline_code, index);
     }
@@ -545,8 +604,10 @@ void CoverageMachine::install_hooks() {
     m_collect_state_guest = m_vm.mmap_allocate(0x1000, 0x7, false);
     m_collect_state = (struct CollectorState *)m_vm.main_memory().at(m_collect_state_guest, sizeof(*m_collect_state));
 
+    // Create coverage bitmap
     m_collect_state->coverage_map = (uintptr_t)m_vm.mmap_allocate(COVERAGE_BITMAP_SIZE, 0x7, false);
 #ifdef PRECISE_COVERAGE
+    // Create ringbuffer for precise coverage tracing in the guest
     m_collect_state->trace_log = (uintptr_t)m_vm.mmap_allocate(PRECISE_TRACE_LOG_SIZE, 0x7, false);
     m_collect_state->trace_index = 0;
 #endif
@@ -555,6 +616,13 @@ void CoverageMachine::install_hooks() {
         m_vm.main_memory().physbase + tinykvm::INTR_ASM_ADDR))->vm64_coverage_state = m_collect_state_guest;
 
     m_vm.install_output_handler(on_output_static);
+
+    // For debugging we occasionally want to pre-allocate all of the trampoline
+    // pages, since otherwise dynamically mapped in user code will be at different
+    // addresses and thus set different coverage bits.
+    //for(int i = 0; i < 0x3f; i++) {
+    //    allocate_trampoline();
+    //}
 
     if(ENTRY_TRACING) {
         hook_block(start_address);
