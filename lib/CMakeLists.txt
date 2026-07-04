@@ -43,6 +43,7 @@ if (TINYKVM_ARCH STREQUAL "AMD64")
 		tinykvm/amd64/usercode.cpp
 		tinykvm/amd64/vdso.cpp
 		tinykvm/rsp_client.cpp
+		tinycov/tinycov.cpp
 	)
 endif()
 
