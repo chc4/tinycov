@@ -65,11 +65,12 @@ In no particular order,
 hot loops aren't great
 
 `clang++ --help`:
-* Native: 0.034s
-* tinykvm: 0.43s
-* qemuafl: 0.47s
-* qemuafl with drcov report: 0.88s
-* tinycov: 3.29s
+* Native: 15.7 ms ±   3.1 ms
+* tinykvm: 344.3 ms ±   3.9 ms
+* qemuafl: 278.9 ms ±   5.0 ms
+* qemuafl with drcov report: 518.2 ms ±   5.4 ms
+* tinycov: 3.008 s ±  0.019 s
+* tinycov with trace: 3.821 s ±  0.012 s
 
 Trying to compile real programs fails because clang++ uses `/proc/self/fd` to read files, which breaks with the VMM FD translation :[
 
