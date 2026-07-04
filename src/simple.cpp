@@ -678,7 +678,9 @@ void drain_coverage_log(tinykvm::Machine& machine) {
     for(int i = 0; i < trace_index; i += sizeof(struct CoverageItem)) {
         struct CoverageItem item;
         machine.copy_from_guest(&item, collect_state->trace_log + i,  sizeof(item));
-        fprintf(emit_file, "drain %llx %x %x\n", item.timestamp, item.rip, item.rflags);
+        if(EMIT_COVERAGE) {
+            fprintf(emit_file, "drain %llx %x %x\n", item.timestamp, item.rip, item.rflags);
+        }
     }
 }
 

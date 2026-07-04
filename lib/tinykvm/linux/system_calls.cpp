@@ -969,6 +969,52 @@ void Machine::setup_linux_system_calls(bool unsafe_syscalls)
 					 vfd, fd, new_vfd, new_fd, regs.rax);
 		});
 	Machine::install_syscall_handler(
+		SYS_dup3, [](vCPU& cpu) { // DUP2
+			auto& regs = cpu.registers();
+			const int vfd = regs.rdi;
+			const int new_vfd = regs.rsi;
+			const int flags = regs.rdx;
+			if (vfd == new_vfd)
+			{
+				// dup3 is different from dup2 for this (man dup3)
+				regs.rax = -EINVAL;
+				cpu.set_registers(regs);
+				SYSPRINT("dup3(vfd=%d (%d), new_vfd=%d (%d), flags=%d) = %lld\n",
+						 vfd, vfd, new_vfd, new_vfd, flags, regs.rax);
+				return;
+			}
+			// We otherwise ignore the flags the guest tries to set: O_CLOEXEC is the only one allowed
+			// to be set, which has no observable behavior for a guest VM.
+			int fd = -1;
+			int new_fd = -1;
+			try {
+				fd = cpu.machine().fds().translate(vfd);
+				new_fd = cpu.machine().fds().translate(new_vfd);
+				// Close the new fd if it is open
+				if (new_fd > 2)
+				{
+					close(new_fd);
+					cpu.machine().fds().free(new_vfd);
+				}
+
+				const int result = dup(fd);
+				if (result < 0)
+				{
+					regs.rax = -errno;
+				}
+				else
+				{
+					cpu.machine().fds().manage_as(new_vfd, new_fd, false, false);
+					regs.rax = new_vfd;
+				}
+			} catch (...) {
+				regs.rax = -EBADF;
+			}
+			cpu.set_registers(regs);
+			SYSPRINT("dup3(vfd=%d (%d), new_vfd=%d (%d), flags=%d) = %lld\n",
+					 vfd, fd, new_vfd, new_fd, flags, regs.rax);
+		});
+	Machine::install_syscall_handler(
 		SYS_nanosleep, [](vCPU& cpu) { // nanosleep
 			auto& regs = cpu.registers();
 			regs.rax = 0;
